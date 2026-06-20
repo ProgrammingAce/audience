@@ -14,7 +14,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""audience — a local-LLM shoulder-surfer.
+"""audience — a local-LLM shoulder-surfer for Windows.
 
 A curses TUI that periodically screenshots your active window and asks a
 local llama.cpp (gemma-4-E4B-it) vision model for brief, insightful
@@ -41,38 +41,317 @@ Layout:
 - /quit         exit (also Ctrl-C)
 
 Usage:
-    python3 audience.py
-    python3 audience.py --interval 30
-    python3 audience.py --url http://localhost:8080/v1/chat/completions
+    python audience.py
+    python audience.py --interval 30
+    python audience.py --url http://localhost:8080/v1/chat/completions
 
 Start the llama.cpp server first, e.g.:
-    llama-server -m gemma-4-E4B-it-Q4_K_M.gguf \
+    llama-server.exe -m gemma-4-E4B-it-Q4_K_M.gguf ^
         --mmproj mmproj-gemma-4-E4B.gguf --port 8080
 
-Requires: macOS (screencapture + Quartz/AppKit), llama.cpp serving an
-OpenAI-compatible endpoint with the gemma vision projector loaded.
-Grant Screen Recording permission to your terminal app.
+Requires: Windows 10+, Python 3.9+, mss, Pillow, psutil.
 """
 
 import argparse
 import base64
+import ctypes
+import ctypes.wintypes
 import curses
 import datetime as dt
+import io
 import json
 import os
 import queue
 import random
 import subprocess
 import sys
-import tempfile
 import textwrap
 import threading
 import time
 import urllib.request
+import shutil
 
 import unicodedata
+import mss
+import psutil
 
-import Quartz
+WNDENUMPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_int, ctypes.wintypes.HWND, ctypes.c_long)
+
+
+def hamming(a, b):
+    """Number of differing bits between two integer hashes."""
+    return bin(a ^ b).count("1")
+
+
+# --------------------------------------------------------------------------
+# Platform abstraction layer
+# --------------------------------------------------------------------------
+
+def _capture_active_window():
+    """Take a fresh screenshot of the active window, return PIL Image or None."""
+    from PIL import Image
+
+    try:
+        sct = mss.MSS()
+        pid = _get_active_window_pid()
+        if pid is not None:
+            rect = _get_window_rect(pid)
+            if rect is not None:
+                shot = sct.grab(rect)
+                img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+                sct.close()
+                return img
+        shot = sct.grab(sct.monitors[0])
+        img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+        sct.close()
+        return img
+    except Exception:
+        pass
+    return None
+
+
+def _image_ahash(img):
+    """64-bit average hash of a PIL Image, or None on failure."""
+    try:
+        from PIL import Image
+        gray = img.convert("L").resize((8, 8), Image.LANCZOS)
+        px = list(gray.get_flattened_data()[:8 * 8])
+        mean = sum(px) / len(px)
+        bits = 0
+        for p in px:
+            bits = (bits << 1) | (1 if p > mean else 0)
+        return bits
+    except Exception:
+        return None
+
+
+def _idle_seconds():
+    """Seconds since last keyboard/mouse input, or 0.0 on failure."""
+    try:
+        info = ctypes.wintypes.LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return (time.time() * 1000 - info.dwTime) / 1000.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_active_window_pid():
+    """PID of the process owning the foreground window, or None."""
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if hwnd:
+            pid = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return pid.value
+    except Exception:
+        pass
+    return None
+
+
+def _get_window_rect(pid):
+    """Largest visible window rectangle for the given PID, or None."""
+    rect = None
+    best_area = -1
+
+    def enum_proc(hwnd, user_data):
+        nonlocal rect, best_area
+        try:
+            w_pid = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
+            if w_pid.value != pid:
+                return True
+
+            is_visible = ctypes.windll.user32.IsWindowVisible(hwnd)
+            if not is_visible:
+                return True
+
+            w_rect = ctypes.wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(w_rect)):
+                return True
+
+            width = w_rect.right - w_rect.left
+            height = w_rect.bottom - w_rect.top
+            if width <= 0 or height <= 0:
+                return True
+
+            area = width * height
+            if area > best_area:
+                best_area = area
+                rect = (w_rect.left, w_rect.top, w_rect.right, w_rect.bottom)
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+    return rect
+
+
+def _get_active_window_title():
+    """App name and window title of the foreground window."""
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return {"app": "(unknown)", "title": "(no title)"}
+
+        pid = ctypes.wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+        try:
+            proc = psutil.Process(pid.value)
+            app_name = proc.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            app_name = "(unknown)"
+
+        buf = ctypes.create_unicode_buffer(512)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
+        title = buf.value.strip() or "(no title)"
+
+        return {"app": app_name, "title": title}
+    except Exception:
+        return {"app": "(unknown)", "title": "(no title)"}
+
+
+def _get_battery_info():
+    """Battery percent and state, or None on failure."""
+    # Suppress wmi module stderr (e.g. "Invalid query" on desktops without
+    # a battery) from leaking into the TUI via sys.stderr.
+    _err = open(os.devnull, "w")
+    _old = sys.stderr
+    sys.stderr = _err
+    try:
+        import wmi
+        try:
+            c = wmi.WMI(wmi="root/WMI")
+            for battery in c.Win32_Battery():
+                try:
+                    pct = getattr(battery, "EstimatedChargeRemaining", None)
+                    if pct is not None:
+                        charging = battery.Charging and battery.Charging != False
+                        return {"percent": int(pct),
+                                "state": "charging" if charging else "discharging"}
+                except Exception:
+                    continue
+            # Fallback: WMI power management
+            c2 = wmi.WMI(namespace="root/WMI")
+            for b in c2.BatteryStatus():
+                if hasattr(b, "Charging") and b.Charging:
+                    return {"percent": 100, "state": "charging"}
+                if hasattr(b, "BatteryStatus") and b.BatteryStatus == 1:
+                    return {"percent": 0, "state": "discharging"}
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        sys.stderr = _old
+        _err.close()
+
+    # Last resort: WMIC
+    try:
+        out = subprocess.check_output(
+            ["wmic", "path", "Win32_Battery", "get",
+             "EstimatedChargeRemaining,Charging", "/value"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL)
+        pct = state = None
+        for line in out.strip().split("\n"):
+            if line.startswith("EstimatedChargeRemaining="):
+                pct = int(line.split("=", 1)[1].strip())
+            if line.startswith("Charging="):
+                val = line.split("=", 1)[1].strip()
+                state = "charging" if val == "True" else "discharging"
+        if pct is not None:
+            return {"percent": pct, "state": state or "unknown"}
+    except Exception:
+        pass
+    return None
+
+
+def _free_mem_mb():
+    """Free + available memory in MB, or None on failure."""
+    try:
+        mem = psutil.virtual_memory()
+        return round(mem.available / (1024 * 1024))
+    except Exception:
+        return None
+
+
+def _free_disk_gb():
+    """Free disk space on root drive in GB, or None on failure."""
+    try:
+        usage = shutil.disk_usage("C:\\")
+        return round(usage.free / (1024 ** 3), 1)
+    except Exception:
+        return None
+
+
+def _get_system_stats():
+    """System stats dict with battery, memory, disk, uptime info."""
+    out = {}
+
+    try:
+        cores = psutil.cpu_count(logical=True) or 1
+        load = psutil.getloadavg()
+        out["load_avg"] = {
+            "1m": round(load[0], 2),
+            "5m": round(load[1], 2),
+            "15m": round(load[2], 2),
+        }
+    except Exception:
+        pass
+
+    batt = _get_battery_info()
+    if batt:
+        out["battery"] = batt
+
+    mem = _free_mem_mb()
+    if mem is not None:
+        out["memory_free_mb"] = mem
+
+    disk = _free_disk_gb()
+    if disk is not None:
+        out["disk_free_gb"] = disk
+
+    try:
+        boot_time = psutil.boot_time()
+        uptime_secs = time.time() - boot_time
+        days = int(uptime_secs // 86400)
+        hours = int((uptime_secs % 86400) // 3600)
+        mins = int((uptime_secs % 3600) // 60)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        parts.append(f"{mins}m")
+        out["uptime"] = "up " + " ".join(parts)
+    except Exception:
+        pass
+
+    return out or {"error": "no stats available"}
+
+
+def _now_playing():
+    """Now playing from Spotify desktop, or empty."""
+    try:
+        for proc in psutil.process_iter(["name", "exe"]):
+            try:
+                name = proc.info["name"] or ""
+                exe = (proc.info["exe"] or "").lower()
+                if "spotify" in name.lower() or "spotify" in exe:
+                    return "Spotify"
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return "(nothing playing)"
+
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
 
 
 def _char_width(ch):
@@ -99,6 +378,7 @@ def clip_to_width(text, cols):
         out.append(ch)
         used += w
     return "".join(out)
+
 
 SYSTEM_PROMPT = (
     "You are a dragon perched in the corner of the operator's terminal, "
@@ -194,188 +474,29 @@ HEALTH_SYSTEM_PROMPT = (
     "give it. One or two sentences, no preamble."
 )
 
-# Animated mascot pinned to the top-right corner. Three 12x5 frames, cycled
-# on a timer. Sprite from https://gist.github.com/zmxv/7f83671f860c15be02f45b07fee207fc
+# --------------------------------------------------------------------------
+# Animated mascot
+# --------------------------------------------------------------------------
 DRAGON_FRAMES = [
     ['            ', '  /^\\  /^\\  ', ' <  ·  ·  > ', ' (   ~~   ) ', '  `-vvvv-´  '],
     ['            ', '  /^\\  /^\\  ', ' <  ·  ·  > ', ' (        ) ', '  `-vvvv-´  '],
     ['   ~    ~   ', '  /^\\  /^\\  ', ' <  ·  ·  > ', ' (   ~~   ) ', '  `-vvvv-´  '],
 ]
 DRAGON_W = 12
-DRAGON_FRAME_MS = 500  # matches the leaked buddy's 500ms tick
-# The leaked buddy treats the eye as a fixed identity trait, not an animation:
-# renderSprite(species, eye, hat, frameIdx) takes eye separately from frameIdx.
-# EYES is the set of variants a buddy *can* have (rarity/shiny), default '·' —
-# only the body frames cycle.
+DRAGON_FRAME_MS = 500
 DRAGON_EYE = '·'
 DRAGON_EYES = ['·', '✦', '×', '◉', '@', '°']
-DRAGON_BLINK = '-'        # closed-eye glyph
-DRAGON_REST_FRAME = 0     # frame shown while idle (no movement)
-# The dragon rests most of the time and only comes alive in a brief flourish:
-# every ANIM_PERIOD ticks it animates for ANIM_TICKS ticks, then settles.
-DRAGON_ANIM_PERIOD = 24   # ticks between flourishes (~12s at 500ms)
-DRAGON_ANIM_TICKS = 4     # length of each flourish (~2s)
-DRAGON_SPARKLE_MS = 1500  # how long the dragon sparkles after a screenshot
-# Sparkle glyphs and the cells (row, col) around the 12x5 dragon box where a
-# shiny dragon twinkles. A rotating subset lights up each tick.
+DRAGON_BLINK = '-'
+DRAGON_REST_FRAME = 0
+DRAGON_ANIM_PERIOD = 24
+DRAGON_ANIM_TICKS = 4
+DRAGON_SPARKLE_MS = 1500
 DRAGON_SPARKLES = ['✦', '✧', '·', '*']
 DRAGON_SPARKLE_CELLS = [(0, 1), (0, 10), (1, 0), (2, 11), (4, 0), (4, 11), (1, 6)]
-
-# xterm focus-reporting (DECSET 1004): when enabled the terminal emits ESC[I
-# when audience's tab/window gains keyboard focus and ESC[O when it loses it.
-# That per-tab focus state is what tells us whether the dragon would be looking
-# at itself. Supported by iTerm2, Terminal.app, kitty, wezterm, alacritty.
-FOCUS_REPORTING_ON = "\033[?1004h"
-FOCUS_REPORTING_OFF = "\033[?1004l"
-
-
-# --------------------------------------------------------------------------
-# Screen capture
-# --------------------------------------------------------------------------
-def _onscreen_windows():
-    """On-screen normal windows, front-to-back (Quartz's native order)."""
-    options = (Quartz.kCGWindowListOptionOnScreenOnly
-               | Quartz.kCGWindowListExcludeDesktopElements)
-    return Quartz.CGWindowListCopyWindowInfo(
-        options, Quartz.kCGNullWindowID) or []
-
-
-def frontmost_pid():
-    """PID owning the frontmost on-screen window, or None.
-
-    Derived from Quartz's window ordering rather than
-    NSWorkspace.frontmostApplication(): screenshots run on a worker thread, and
-    AppKit window/app APIs only update reliably on the main thread — off-thread
-    they return a stale cached value, pinning every capture to whatever was
-    frontmost long ago. CGWindowListCopyWindowInfo is thread-safe and returns
-    windows front-to-back, so the first layer-0 window is the live active one.
-    """
-    for w in _onscreen_windows():
-        if w.get("kCGWindowLayer", 1) != 0:
-            continue
-        return w.get("kCGWindowOwnerPID")
-    return None
-
-
-def frontmost_window_id():
-    """CGWindowID of the frontmost app's largest normal window, or None."""
-    pid = frontmost_pid()
-
-    best = None
-    for w in _onscreen_windows():
-        if w.get("kCGWindowLayer", 1) != 0:
-            continue
-        if pid is not None and w.get("kCGWindowOwnerPID") != pid:
-            continue
-        b = w.get("kCGWindowBounds", {})
-        area = b.get("Width", 0) * b.get("Height", 0)
-        if best is None or area > best[1]:
-            best = (w.get("kCGWindowNumber"), area)
-    return best[0] if best else None
-
-
-def idle_seconds():
-    """Seconds since the last user input event (keyboard/mouse), or 0.0.
-
-    Any failure returns 0.0 (treated as "active") so a flaky idle probe can
-    never wedge commentary off.
-    """
-    try:
-        return Quartz.CGEventSourceSecondsSinceLastEventType(
-            Quartz.kCGEventSourceStateCombinedSessionState,
-            Quartz.kCGAnyInputEventType)
-    except Exception:
-        return 0.0
-
-
-def capture():
-    """Take a fresh screenshot of the active window and return PNG bytes.
-
-    The file is written to a unique path, read, and deleted immediately so
-    nothing is persisted and no stale image can ever be reused. Returns the
-    PNG bytes, or None on failure.
-    """
-    import os
-    fd, path = tempfile.mkstemp(prefix="audience-", suffix=".png")
-    os.close(fd)
-    os.unlink(path)  # screencapture needs a non-existent target to write cleanly
-    try:
-        try:
-            wid = frontmost_window_id()
-        except Exception:
-            wid = None
-
-        ok = False
-        if wid is not None:
-            ok = subprocess.run(
-                ["screencapture", "-x", "-o", "-l", str(wid), path]
-            ).returncode == 0 and os.path.exists(path)
-        if not ok:
-            ok = subprocess.run(
-                ["screencapture", "-x", path]
-            ).returncode == 0 and os.path.exists(path)
-        if not ok:
-            return None
-        with open(path, "rb") as f:
-            return f.read()
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
-
-
-# --------------------------------------------------------------------------
-# Change detection
-#
-# A cheap average-hash (aHash) of each screenshot lets us tell whether the
-# screen actually changed since the last shot. When it hasn't, there's nothing
-# new to comment on, so we skip the model call and lengthen the interval.
-# --------------------------------------------------------------------------
-def image_ahash(png_bytes):
-    """64-bit average hash of a PNG, or None on failure.
-
-    Decodes the PNG with CoreGraphics (already imported as Quartz), draws it
-    into an 8x8 grayscale buffer we own, and sets each of the 64 bits to
-    (pixel > mean). Dependency-free; returns None if anything goes wrong so the
-    caller can treat an un-hashable frame as "changed" rather than going silent.
-    """
-    try:
-        data = Quartz.CFDataCreate(None, png_bytes, len(png_bytes))
-        src = Quartz.CGImageSourceCreateWithData(data, None)
-        if src is None:
-            return None
-        img = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
-        if img is None:
-            return None
-        w = h = 8
-        buf = bytearray(w * h)
-        cs = Quartz.CGColorSpaceCreateDeviceGray()
-        ctx = Quartz.CGBitmapContextCreate(
-            buf, w, h, 8, w, cs, Quartz.kCGImageAlphaNone)
-        if ctx is None:
-            return None
-        Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, w, h), img)
-        mean = sum(buf) / len(buf)
-        bits = 0
-        for px in buf:
-            bits = (bits << 1) | (1 if px > mean else 0)
-        return bits
-    except Exception:
-        return None
-
-
-def hamming(a, b):
-    """Number of differing bits between two integer hashes."""
-    return bin(a ^ b).count("1")
 
 
 # --------------------------------------------------------------------------
 # Agent tools
-#
-# Read-only, local, low-sensitivity facts the model can pull to ground its
-# commentary instead of guessing from a fuzzy screenshot. Every tool here must
-# be safe even if the model is fully prompt-injected by an adversarial screen:
-# nothing reads secrets (clipboard, history, arbitrary files), writes, executes
-# shell input, or sends data off the machine.
 # --------------------------------------------------------------------------
 def tool_now(**_):
     """Current local date and time."""
@@ -387,145 +508,21 @@ def tool_now(**_):
 
 
 def tool_active_window_info(**_):
-    """App name and window title of the frontmost window.
-
-    Fixes the model's biggest blind spot: tiny, unreadable title bars. Uses the
-    same window metadata capture() already relies on — and the same thread-safe
-    Quartz window ordering, so it never disagrees with the captured window.
-    """
-    app_name, title = None, None
-    try:
-        pid = frontmost_pid()
-        best_area = -1
-        for w in _onscreen_windows():
-            if w.get("kCGWindowLayer", 1) != 0:
-                continue
-            if pid is not None and w.get("kCGWindowOwnerPID") != pid:
-                continue
-            b = w.get("kCGWindowBounds", {})
-            area = b.get("Width", 0) * b.get("Height", 0)
-            if area > best_area:
-                best_area = area
-                app_name = w.get("kCGWindowOwnerName") or app_name
-                name = w.get("kCGWindowName")
-                if name:
-                    title = name
-    except Exception:
-        pass
-
-    return {"app": app_name or "(unknown)", "title": title or "(no title)"}
-
-
-def read_battery():
-    """Battery percent and charge state via pmset, or None on failure.
-
-    Shared by tool_system_stats and the health-watch loop so the two never
-    disagree on what the battery is doing.
-    """
-    try:
-        r = subprocess.run(["pmset", "-g", "batt"],
-                           capture_output=True, text=True, timeout=5)
-        pct, state = None, None
-        for tok in r.stdout.replace(";", " ").split():
-            if tok.endswith("%"):
-                pct = tok.rstrip("%")
-            if tok in ("charging", "discharging", "charged"):
-                state = tok
-        if pct is not None:
-            return {"percent": int(pct), "state": state or "unknown"}
-    except Exception:
-        pass
-    return None
-
-
-def read_free_mem_mb():
-    """Free + speculative memory in MB via vm_stat, or None on failure."""
-    try:
-        page = int(subprocess.run(["sysctl", "-n", "hw.pagesize"],
-                   capture_output=True, text=True, timeout=5).stdout.strip())
-        r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
-        free_pages = 0
-        for line in r.stdout.splitlines():
-            if line.startswith("Pages free:") or \
-                    line.startswith("Pages speculative:"):
-                free_pages += int(line.rsplit(":", 1)[1].strip().rstrip("."))
-        if free_pages:
-            return round(free_pages * page / (1024 * 1024))
-    except Exception:
-        pass
-    return None
-
-
-def read_free_disk_gb():
-    """Free space on the root volume in GB, or None on failure."""
-    try:
-        import shutil
-        return round(shutil.disk_usage("/").free / (1024 ** 3), 1)
-    except Exception:
-        return None
+    """App name and window title of the frontmost window."""
+    return _get_active_window_title()
 
 
 def tool_system_stats(**_):
-    """Battery, CPU load, free memory, free disk, and uptime — all read-only."""
-    out = {}
-    try:
-        load1, load5, load15 = os.getloadavg()
-        out["load_avg"] = {"1m": round(load1, 2), "5m": round(load5, 2),
-                           "15m": round(load15, 2)}
-    except Exception:
-        pass
-    batt = read_battery()
-    if batt is not None:
-        out["battery"] = batt
-    mem = read_free_mem_mb()
-    if mem is not None:
-        out["memory_free_mb"] = mem
-    disk = read_free_disk_gb()
-    if disk is not None:
-        out["disk_free_gb"] = disk
-    try:
-        r = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
-        out["uptime"] = r.stdout.strip()
-    except Exception:
-        pass
-    return out or {"error": "no stats available"}
+    """Battery, CPU load, free memory, free disk, and uptime."""
+    return _get_system_stats()
 
 
 def tool_now_playing(**_):
-    """Currently playing track from Music or Spotify, if either is running."""
-    script = '''
-    on trackOf(appName)
-      tell application "System Events"
-        if not (exists process appName) then return ""
-      end tell
-      tell application appName
-        if player state is playing then
-          return (name of current track) & " — " & (artist of current track)
-        end if
-      end tell
-      return ""
-    end trackOf
-    set s to ""
-    try
-      set s to trackOf("Spotify")
-    end try
-    if s is "" then
-      try
-        set s to trackOf("Music")
-      end try
-    end if
-    return s
-    '''
-    try:
-        r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=8)
-        track = r.stdout.strip()
-    except Exception:
-        track = ""
-    return {"now_playing": track or "(nothing playing)"}
+    """Currently playing track from Spotify, if running."""
+    player = _now_playing()
+    return {"now_playing": player if player != "(nothing playing)" else "(nothing playing)"}
 
 
-# name -> (callable, JSON schema) for the OpenAI-style tools array.
 TOOLS = {
     "now": (tool_now, {
         "type": "function",
@@ -555,7 +552,7 @@ TOOLS = {
         "type": "function",
         "function": {
             "name": "now_playing",
-            "description": "Get the song currently playing in Music or Spotify, "
+            "description": "Get the song currently playing in Spotify, "
                            "if anything is playing.",
             "parameters": {"type": "object", "properties": {}},
         }}),
@@ -584,8 +581,6 @@ def run_tool(name, arguments):
 # Model call
 # --------------------------------------------------------------------------
 def ask_model(url, image_bytes, question, system):
-    # image_bytes is optional: typed questions are sent as plain text, while
-    # the periodic commentary attaches a fresh screenshot.
     if image_bytes is not None:
         b64 = base64.b64encode(image_bytes).decode()
         content = [
@@ -601,10 +596,6 @@ def ask_model(url, image_bytes, question, system):
         {"role": "user", "content": content},
     ]
 
-    # Tool-calling loop: the model may ask for one or more read-only local
-    # facts (window title, time, battery, now-playing) before answering. We run
-    # the requested tools, feed the results back, and ask again — bounded so a
-    # confused model can't loop forever.
     for _ in range(4):
         payload = {
             "messages": messages,
@@ -613,9 +604,6 @@ def ask_model(url, image_bytes, question, system):
             "temperature": 0.7,
             "max_tokens": 450,
             "stream": False,
-            # Skip the reasoning phase: ~10x faster and content lands directly
-            # in the message instead of reasoning_content. Honored by the
-            # server's jinja chat template.
             "chat_template_kwargs": {"enable_thinking": False},
         }
         req = urllib.request.Request(
@@ -628,8 +616,6 @@ def ask_model(url, image_bytes, question, system):
 
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
-            # Echo the assistant turn (with its tool_calls) then append one
-            # tool result per call, keyed by id.
             messages.append({
                 "role": "assistant",
                 "content": msg.get("content") or "",
@@ -643,13 +629,11 @@ def ask_model(url, image_bytes, question, system):
                     "tool_call_id": call.get("id"),
                     "content": json.dumps(result),
                 })
-            continue  # ask again now that the model has its facts
+            continue
 
         content = (msg.get("content") or "").strip()
         if content:
             return content
-        # Reasoning model: answer may live in reasoning_content. If it got cut
-        # off mid-thought, surface what we have rather than a blank line.
         reasoning = (msg.get("reasoning_content") or "").strip()
         if reasoning:
             if choice.get("finish_reason") == "length":
@@ -665,52 +649,29 @@ def ask_model(url, image_bytes, question, system):
 # --------------------------------------------------------------------------
 class Audience:
     def __init__(self, url, interval, idle_timeout=120.0, max_backoff_mult=6,
-                 health_interval=900.0, health_enabled=True, show_timing=False):
+                  health_interval=900.0, health_enabled=True, show_timing=False):
         self.url = url
-        # When True, append the server's response time to each model message.
         self.show_timing = show_timing
-        # base interval between shots; the live gap grows from here via backoff
-        # and is jittered each cycle (see scheduler()).
         self.base_interval = interval
         self.idle_timeout = idle_timeout
-        # Adaptive backoff: each time the screen is essentially unchanged we
-        # bump backoff_level, multiplying the gap by min(2**level, max). A real
-        # change snaps it back to 0. last_hash is the previous shot's aHash; a
-        # Hamming distance <= change_threshold_bits (out of 64) counts as
-        # "unchanged" — moderate sensitivity.
         self.max_backoff_mult = max_backoff_mult
         self.backoff_level = 0
         self.last_hash = None
         self.change_threshold_bits = 3
-        # True once we've logged the "screen unchanged" notice for the current
-        # quiet stretch, so we announce the lull once rather than every skip.
         self.lull_announced = False
-        self.jobs = queue.Queue()        # (kind, payload)
-        self.log = []                    # list of (style, text, transient) raw lines
+        self.jobs = queue.Queue()
+        self.log = []
         self.log_lock = threading.Lock()
-        self.scroll = 0                  # lines scrolled up from bottom
+        self.scroll = 0
         self.stop = threading.Event()
-        # Shiny by default: the dragon sparkles for a moment each time a
-        # screenshot is taken. (Disable the sparkles with --no-shiny.)
         self.shiny = True
-        self.sparkle_until = 0.0   # monotonic deadline for the sparkle burst
-        # Whether audience's own tab holds keyboard focus. Driven by terminal
-        # focus-reporting events (ESC[I / ESC[O). Starts True: audience launches
-        # in the foreground, so assume focused until the terminal says otherwise.
+        self.sparkle_until = 0.0
         self.focused = True
-        # Our process's ancestor PIDs (shell, terminal GUI app, ...), computed
-        # lazily once. Used to tell whether the frontmost app is our own
-        # terminal, as an independent cross-check on the focus flag.
         self._ancestors = None
-        # True once we've logged the "waiting" notice for the current focused
-        # stretch, so we announce it once and not on every retry.
         self.waiting_announced = False
-        # System-health watch: an independent ~health_interval loop checks
-        # battery/CPU/memory and has the dragon quip when a condition crosses a
-        # threshold. health_state maps an active condition key -> the tier we
-        # last announced, so we warn once per episode (and again if it worsens)
-        # rather than every tick. _last_batt is the previous (percent, monotonic)
-        # battery sample, used to estimate drain rate.
+        # Capture the foreground HWND *before* curses takes over so we know
+        # which window the operator was looking at when the script started.
+        self._start_hwnd = ctypes.windll.user32.GetForegroundWindow()
         self.health_interval = health_interval
         self.health_enabled = health_enabled
         self.health_state = {}
@@ -720,47 +681,64 @@ class Audience:
         """Set of our PID and all ancestor PIDs (shell -> terminal app)."""
         if self._ancestors is not None:
             return self._ancestors
-        pids, pid = set(), os.getpid()
-        for _ in range(20):
-            pids.add(pid)
-            try:
-                out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
-                                     capture_output=True, text=True, timeout=2)
-                ppid = int(out.stdout.strip())
-            except Exception:
-                break
-            if ppid <= 1 or ppid in pids:
-                break
-            pid = ppid
+
+        pids = set()
+        try:
+            proc = psutil.Process()
+            pids.add(proc.pid)
+            while True:
+                try:
+                    parent = proc.parent()
+                    if parent is None:
+                        break
+                    if parent.pid in pids:
+                        break
+                    pids.add(parent.pid)
+                    proc = parent
+                except psutil.NoSuchProcess:
+                    break
+        except Exception:
+            pass
+
         self._ancestors = pids
         return pids
 
     def is_own_window(self):
-        """True if a screenshot now would catch the dragon watching itself.
+        """True if a screenshot now would catch the dragon watching itself."""
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
 
-        Primary signal is terminal focus-reporting (self.focused), which tracks
-        focus at the tab level. But that flag goes stale if a focus-out event is
-        ever dropped, which would pause screenshots forever. So we cross-check:
-        if the frontmost window belongs to some app that isn't our terminal
-        (its owner PID isn't one of our ancestors), we're plainly not looking at
-        ourselves and can shoot regardless of a stale focus flag.
-        """
-        fg = frontmost_pid()
-        if fg is not None and fg not in self._ancestor_pids():
+        # If the user switched to a DIFFERENT window, it's safe to
+        # screenshot.  If the same window is still on top the user
+        # clicked back to the dragon — skip.
+        if fg_hwnd != self._start_hwnd:
             return False
-        return self.focused
+
+        # The same window handle is still on top, but it *might* be
+        # running a *different* process (e.g. the user closed the
+        # original PowerShell and opened another one that reused the
+        # same console handle).  In that case it's safe to screenshot.
+        # We compare PIDs as a tie-breaker.
+        try:
+            start_pid = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(
+                self._start_hwnd, ctypes.byref(start_pid))
+            fg_pid = ctypes.wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(
+                fg_hwnd, ctypes.byref(fg_pid))
+            if start_pid.value != fg_pid.value:
+                return False
+        except Exception:
+            pass
+
+        return True
 
     # --- logging -----------------------------------------------------------
     def emit(self, text, style="normal", transient=False):
-        # transient lines (e.g. "Screen's quiet", "This window is active") are
-        # status notices that should vanish once real processing resumes; see
-        # clear_transient().
         stamp = dt.datetime.now().strftime("%H:%M:%S")
         with self.log_lock:
             self.log.append((style, f"[{stamp}] {text}", transient))
 
     def clear_transient(self):
-        """Drop transient status hints — called when commentary resumes."""
         with self.log_lock:
             self.log = [e for e in self.log if not e[2]]
 
@@ -776,6 +754,10 @@ class Audience:
             label = "Dragon" if style == "model" else "You"
             lines.append(f"{label}: {text}")
         return "Recent exchange:\n" + "\n".join(lines) + "\n\n"
+
+    def clear_transient(self):
+        with self.log_lock:
+            self.log = [e for e in self.log if not e[2]]
 
     # --- worker: serial model calls ---------------------------------------
     def worker(self):
@@ -800,20 +782,16 @@ class Audience:
 
     def _do(self, question, system, screenshot):
         image = None
+        img = None
         if screenshot:
-            # pause periodic commentary while the operator is away: no point
-            # commenting on a static screen they aren't looking at. Announce
-            # once per away-stretch, then re-check shortly until input resumes.
-            if idle_seconds() >= self.idle_timeout:
+            if _idle_seconds() >= self.idle_timeout:
                 if not self.waiting_announced:
                     self.emit("You seem to be away — pausing screenshots "
                               "until you're back.", style="hint", transient=True)
                     self.waiting_announced = True
                 self.schedule_screenshot(15)
                 return
-            # don't let the dragon watch itself: if audience's own tab is
-            # focused, skip this shot and try again shortly. Announce the wait
-            # only once per stretch so repeated retries don't spam the log.
+
             if self.is_own_window():
                 if not self.waiting_announced:
                     self.emit("This window is active — waiting...",
@@ -822,18 +800,14 @@ class Audience:
                 self.schedule_screenshot(15)
                 return
             self.waiting_announced = False
-            image = capture()  # fresh shot every call; nothing persisted
-            if image is None:
-                self.emit("screenshot failed — check Screen Recording "
-                          "permission for your terminal.", style="error")
+
+            img = _capture_active_window()
+            if img is None:
+                self.emit("screenshot failed — check that your terminal has "
+                          "access to capture the screen.", style="error")
                 return
-            # Change detection: if the screen is essentially unchanged since the
-            # last shot, there's nothing new to remark on. Skip the model call
-            # and lengthen the interval (adaptive backoff). A real change resets
-            # the backoff so commentary snaps back to the base cadence. An
-            # un-hashable frame (h is None) counts as changed, so we never go
-            # silent on a hashing failure.
-            h = image_ahash(image)
+
+            h = _image_ahash(img)
             if (self.last_hash is not None and h is not None
                     and hamming(h, self.last_hash) <= self.change_threshold_bits):
                 self.last_hash = h
@@ -846,10 +820,19 @@ class Audience:
             self.last_hash = h
             self.backoff_level = 0
             self.lull_announced = False
-            # processing resumed — clear any lingering "quiet"/"away"/"active" hints
             self.clear_transient()
-            # a shot worth commenting on: let the dragon sparkle for a moment
             self.sparkle_until = time.monotonic() + DRAGON_SPARKLE_MS / 1000.0
+
+            # Convert PIL Image to PNG bytes
+            buf = io.BytesIO()
+            try:
+                img.save(buf, format="PNG")
+                image = buf.getvalue()
+            except Exception:
+                self.emit("screenshot failed — unable to encode image.",
+                          style="error")
+                return
+
         try:
             recent = self._recent_messages()
             if recent:
@@ -866,14 +849,10 @@ class Audience:
 
     # --- scheduler: periodic commentary -----------------------------------
     def scheduler(self):
-        # initial shot 5s after start
         if self.stop.wait(5):
             return
         self.jobs.put(("commentary", None))
         while True:
-            # Live gap = base * backoff multiplier, jittered +/-25% so the
-            # cadence feels organic rather than metronomic. backoff_level is
-            # updated by the worker (_do) after each shot's change check.
             mult = min(2 ** self.backoff_level, self.max_backoff_mult)
             delay = self.base_interval * mult * random.uniform(0.75, 1.25)
             if self.stop.wait(delay):
@@ -886,27 +865,18 @@ class Audience:
                 self.jobs.put(("commentary", question))
         threading.Thread(target=go, daemon=True).start()
 
-    # --- health watch: periodic system-condition checks -------------------
+    # --- health watch -----------------------------------------------------
     def evaluate_health(self):
-        """Currently-active health conditions as (key, tier, fact) tuples.
-
-        key is a stable id; tier is a small integer that increases as a
-        condition worsens (so the worsening re-fires past the once-per-episode
-        filter); fact is the plain-English line handed to the model. Every probe
-        is defensive — a failed read just omits that condition.
-        """
         findings = []
 
-        batt = read_battery()
+        batt = _get_battery_info()
         if batt is not None and batt.get("state") == "discharging":
             pct = batt["percent"]
-            # low battery: warn harder as it drops (tiers at <=20/10/5)
             if pct <= 20:
                 tier = 3 if pct <= 5 else 2 if pct <= 10 else 1
                 findings.append((
                     "battery_low", tier,
                     f"Battery is at {pct}% and discharging."))
-            # drain rate from the previous sample
             now = time.monotonic()
             if self._last_batt is not None:
                 prev_pct, prev_t = self._last_batt
@@ -922,42 +892,36 @@ class Audience:
                             f"(now {pct}%)."))
             self._last_batt = (pct, now)
         else:
-            # plugged in / unknown: reset the drain baseline so a later unplug
-            # measures from fresh, not across the charge.
             self._last_batt = None
 
         try:
-            load1 = os.getloadavg()[0]
-            cores = os.cpu_count() or 1
-            ratio = load1 / cores
-            if ratio >= 1.0:
-                tier = 2 if ratio >= 2.0 else 1
-                findings.append((
-                    "cpu_high", tier,
-                    f"CPU is under heavy load: 1-min load average {load1:.1f} "
-                    f"across {cores} cores."))
+            stats = _get_system_stats()
+            if "load_avg" in stats:
+                load1 = stats["load_avg"]["1m"]
+                cores = psutil.cpu_count(logical=True) or 1
+                ratio = load1 / cores
+                if ratio >= 1.0:
+                    tier = 2 if ratio >= 2.0 else 1
+                    findings.append((
+                        "cpu_high", tier,
+                        f"CPU is under heavy load: 1-min load average {load1:.1f} "
+                        f"across {cores} cores."))
         except Exception:
             pass
 
-        mem = read_free_mem_mb()
-        if mem is not None and mem < 500:
-            tier = 2 if mem < 200 else 1
-            findings.append((
-                "mem_low", tier,
-                f"Free memory is low: about {mem} MB available."))
+        try:
+            mem = _free_mem_mb()
+            if mem is not None and mem < 500:
+                tier = 2 if mem < 200 else 1
+                findings.append((
+                    "mem_low", tier,
+                    f"Free memory is low: about {mem} MB available."))
+        except Exception:
+            pass
 
         return findings
 
     def health_scheduler(self):
-        """Independent loop: every ~health_interval, surface new health issues.
-
-        Runs regardless of whether the operator is away or audience's own window
-        is focused — a health alert (a dying or fast-draining battery, a pegged
-        CPU) matters most precisely when you've stepped away, so it's never gated
-        by the idle/away pause or the active-window lock that hold back
-        screenshot commentary. Only newly active or worsened conditions are
-        queued, so a steady problem warns once per episode rather than every tick.
-        """
         while True:
             delay = self.health_interval * random.uniform(0.75, 1.25)
             if self.stop.wait(delay):
@@ -975,7 +939,6 @@ class Audience:
                     self.jobs.put(("health", fact))
                 else:
                     self.health_state[key] = tier
-            # drop cleared conditions so they re-announce next time they occur
             for key in list(self.health_state):
                 if key not in active:
                     del self.health_state[key]
@@ -1017,28 +980,22 @@ class Audience:
     # --- curses UI ---------------------------------------------------------
     def render(self, stdscr, buf):
         h, w = stdscr.getmaxyx()
-        out_h = h - 2  # leave bottom 2 rows for separator + input
+        out_h = h - 2
 
-        # The dragon is pinned to the top-right corner. Reserve its columns by
-        # wrapping all text to a dragon-aware width, so no line ever wraps past
-        # the dragon's edge only to be clipped — which would silently drop the
-        # tail of a word and paint the sprite over it.
         tick = int(time.time() * 1000 / DRAGON_FRAME_MS)
         phase = tick % DRAGON_ANIM_PERIOD
         active = phase >= DRAGON_ANIM_PERIOD - DRAGON_ANIM_TICKS
         if active:
             body = DRAGON_FRAMES[phase % len(DRAGON_FRAMES)]
-            # a single blink partway through the flourish
             eye = DRAGON_BLINK if phase == DRAGON_ANIM_PERIOD - 2 else DRAGON_EYE
         else:
             body = DRAGON_FRAMES[DRAGON_REST_FRAME]
             eye = DRAGON_EYE
         frame = [ln.replace('·', eye) for ln in body]
         dx = w - DRAGON_W - 1
-        gutter = 1  # blank column between text and dragon
+        gutter = 1
         text_cap = dx - gutter if dx > 0 else w - 1
 
-        # wrap log into display lines
         with self.log_lock:
             entries = list(self.log)
         styles = {
@@ -1048,9 +1005,9 @@ class Audience:
             "hint": curses.color_pair(4),
             "normal": curses.A_NORMAL,
         }
-        wrapped = []  # (attr, text)
+        wrapped = []
         for idx, (style, text, _transient) in enumerate(entries):
-            if idx:  # blank spacer line between entries
+            if idx:
                 wrapped.append((curses.A_NORMAL, ""))
             attr = styles.get(style, curses.A_NORMAL)
             for line in textwrap.wrap(text, max(1, text_cap)) or [""]:
@@ -1064,15 +1021,11 @@ class Audience:
 
         stdscr.erase()
         for row, (attr, line) in enumerate(view):
-            # lines are already wrapped to text_cap; clip is a safety net for
-            # wide glyphs whose display width exceeds their character count.
             try:
                 stdscr.addstr(row, 0, clip_to_width(line, text_cap), attr)
             except curses.error:
                 pass
 
-        # animated dragon pinned to the top-right corner. Frame advances on a
-        # wall-clock timer.
         if dx > 0 and out_h >= len(frame):
             for i, line in enumerate(frame):
                 try:
@@ -1080,12 +1033,9 @@ class Audience:
                 except curses.error:
                     pass
 
-            # shiny dragon: sparkle only in the brief window after a screenshot
-            # is taken. A rotating subset of cells twinkles, over blank cells
-            # only so the sprite stays intact.
             if self.shiny and time.monotonic() < self.sparkle_until:
                 for n, (sr, sc) in enumerate(DRAGON_SPARKLE_CELLS):
-                    if (tick + n) % 3:           # ~1/3 of cells lit per tick
+                    if (tick + n) % 3:
                         continue
                     if sr >= len(frame) or sc >= len(frame[sr]) \
                             or frame[sr][sc] != ' ':
@@ -1097,7 +1047,6 @@ class Audience:
                     except curses.error:
                         pass
 
-        # separator + input
         sep = "─" * (w - 1)
         try:
             stdscr.addstr(h - 2, 0, sep, curses.A_DIM)
@@ -1116,27 +1065,16 @@ class Audience:
         curses.curs_set(1)
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN, -1)    # you
-        curses.init_pair(2, curses.COLOR_GREEN, -1)   # model
-        curses.init_pair(3, curses.COLOR_RED, -1)     # error
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)  # hint
-        # gold for the dragon: use a true gold from the 256-color palette when
-        # available, else fall back to yellow.
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)
         gold = 178 if curses.COLORS >= 256 else curses.COLOR_YELLOW
-        curses.init_pair(5, gold, -1)                 # dragon (gold)
+        curses.init_pair(5, gold, -1)
         stdscr.nodelay(True)
         stdscr.keypad(True)
 
-        # Ask the terminal to report focus changes (ESC[I / ESC[O) so we know
-        # when audience's own tab is the focused one. Always turn it back off on
-        # exit so the terminal doesn't keep echoing focus codes afterward.
-        sys.stdout.write(FOCUS_REPORTING_ON)
-        sys.stdout.flush()
-        try:
-            self._loop(stdscr)
-        finally:
-            sys.stdout.write(FOCUS_REPORTING_OFF)
-            sys.stdout.flush()
+        self._loop(stdscr)
 
     def _loop(self, stdscr):
         self.emit("audience ready. First screenshot in 5s. "
@@ -1150,7 +1088,7 @@ class Audience:
             threading.Thread(target=self.health_scheduler, daemon=True).start()
 
         buf = ""
-        esc = 0  # escape-sequence state: 0=none, 1=saw ESC, 2=saw ESC[
+        esc = 0
         while not self.stop.is_set():
             self.render(stdscr, buf)
             try:
@@ -1159,8 +1097,6 @@ class Audience:
                 time.sleep(0.05)
                 continue
             if isinstance(ch, str):
-                # Focus-reporting events arrive as the chars ESC, '[', 'I'/'O'.
-                # Intercept them before they reach the prompt buffer.
                 if esc == 0 and ch == "\x1b":
                     esc = 1
                     continue
@@ -1175,15 +1111,14 @@ class Audience:
                     if ch == "O":
                         self.focused = False
                         continue
-                    # not a focus event — fall through and treat as normal input
                 if ch in ("\n", "\r"):
                     self.handle_submit(buf)
                     buf = ""
-                elif ch in ("\x7f", "\b"):  # backspace
+                elif ch in ("\x7f", "\b"):
                     buf = buf[:-1]
-                elif ch == "\x03":          # Ctrl-C
+                elif ch == "\x03":
                     self.stop.set()
-                elif ch == "\x15":          # Ctrl-U clear line
+                elif ch == "\x15":
                     buf = ""
                 elif ch.isprintable():
                     buf += ch
@@ -1234,10 +1169,18 @@ def main():
                    show_timing=args.show_timing)
     if args.no_shiny:
         app.shiny = False
+    # Redirect stdout to stderr while curses is running. PSReadline (PowerShell)
+    # captures stdout writes and can render BEL escape sequences as garbled
+    # glyphs in the input box. Curses writes directly to the console handle,
+    # so this doesn't affect the TUI display.
+    _saved_stdout = sys.stdout
+    sys.stdout = sys.stderr
     try:
         curses.wrapper(app.run)
     except KeyboardInterrupt:
         pass
+    finally:
+        sys.stdout = _saved_stdout
     print("bye.")
 
 
