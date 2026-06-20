@@ -69,7 +69,6 @@ import textwrap
 import threading
 import time
 import urllib.request
-import re
 
 import unicodedata
 
@@ -149,9 +148,6 @@ SYSTEM_PROMPT = (
     "window title, when a title bar is too small to read), now (date/time), "
     "system_stats (battery, CPU load, memory, disk, uptime), and now_playing (current "
     "track). Call one only when it would sharpen the remark; don't narrate that "
-    "you used it. You also have a special syntax: prefix any filename with @ "
-    "to have its contents injected into your response (e.g., @README.md). Only "
-    "files in the working directory can be read this way.\n"
     "\n"
     "Think of yourself as a knowledgeable colleague who notices everything. "
     "Keep it brief and entertaining — two or three sentences, the most "
@@ -220,9 +216,6 @@ HEALTH_SYSTEM_PROMPT = (
     "'the little spark', 'the little morsel', 'the little one', or similar cutesy\n"
     "labels for the operator within a short stretch. Vary your references or skip\n"
     "the nickname entirely.\n"
-    "You also have a special syntax: prefix any filename with @ "
-    "to have its contents injected into your response (e.g., @README.md). Only "
-    "files in the working directory can be read this way."
 )
 
 # Animated mascot pinned to the top-right corner. Three 12x5 frames, cycled
@@ -569,21 +562,6 @@ def _safe_path(rel_path):
     return full, None
 
 
-def _read_from_at(text):
-    """Scan text for @filename patterns and replace with file contents."""
-    def _replace(match):
-        filename = match.group(1)
-        resolved, err = _safe_path(filename)
-        if err:
-            return match.group(0)
-        try:
-            with open(resolved, "r") as f:
-                return f.read()
-        except Exception:
-            return f"[could not read {filename}]"
-    return re.sub(r'@(\S+)', _replace, text)
-
-
 def tool_write_file(path, content=""):
     """Write text to a file in the current working directory."""
     resolved, err = _safe_path(path)
@@ -889,12 +867,10 @@ class Audience:
                           system=SYSTEM_PROMPT, screenshot=True)
             elif kind == "question":
                 self.emit(f"you: {payload}", style="you")
-                # Scan for @filename patterns and replace with file contents
-                scanned_question = _read_from_at(payload)
-                self._do(question=scanned_question, system=QA_SYSTEM_PROMPT,
+                self._do(question=payload, system=QA_SYSTEM_PROMPT,
                           screenshot=False)
             elif kind == "health":
-                self._do(question=_read_from_at(payload), system=HEALTH_SYSTEM_PROMPT,
+                self._do(question=payload, system=HEALTH_SYSTEM_PROMPT,
                           screenshot=False)
 
     def _do(self, question, system, screenshot):
@@ -959,8 +935,6 @@ class Audience:
         except Exception as e:
             self.emit(f"model call failed: {e}", style="error")
             return
-        # Scan for @filename patterns and replace with file contents
-        answer = _read_from_at(answer)
         if self.show_timing:
             answer = f"{answer}  ({elapsed:.1f}s)"
         self.emit(answer, style="model")
