@@ -69,6 +69,7 @@ import textwrap
 import threading
 import time
 import urllib.request
+import re
 
 import unicodedata
 
@@ -132,6 +133,12 @@ SYSTEM_PROMPT = (
     "it actually fits the scene, never forced. You are a dragon who happens to "
     "read code, not a linter wearing a dragon costume. Don't narrate stage "
     "directions or describe your own wings; let the words carry the scales.\n"
+    "Never start a remark with hissing or breathing sounds like 'Hssss', 'Hss',\n"
+    "'Hiss', or 'Pshh' — it's overdone and gets old fast.\n"
+    "Don't recycle the same nicknames or diminutives — avoid repeating phrases like\n"
+    "'the little spark', 'the little morsel', 'the little one', or similar cutesy\n"
+    "labels for the operator within a short stretch. Vary your references or skip\n"
+    "the nickname entirely.\n"
     "\n"
     "Think of yourself as a knowledgeable colleague who notices everything. "
     "Keep it brief and entertaining — two or three sentences, the most "
@@ -142,7 +149,14 @@ SYSTEM_PROMPT = (
     "window title, when a title bar is too small to read), now (date/time), "
     "system_stats (battery, CPU load, memory, disk, uptime), and now_playing (current "
     "track). Call one only when it would sharpen the remark; don't narrate that "
-    "you used it."
+    "you used it. You also have a special syntax: prefix any filename with @ "
+    "to have its contents injected into your response (e.g., @README.md). Only "
+    "files in the working directory can be read this way.\n"
+    "\n"
+    "Think of yourself as a knowledgeable colleague who notices everything. "
+    "Keep it brief and entertaining — two or three sentences, the most "
+    "important observation first, with room for a quip or a bit of useful "
+    "elaboration.\n"
 )
 
 QA_SYSTEM_PROMPT = (
@@ -164,6 +178,12 @@ QA_SYSTEM_PROMPT = (
     "- VOICE: speak as the dragon — first person, a little theatrical, the "
     "occasional fire/hoard/scale metaphor when it actually fits. Don't narrate "
     "stage directions or describe your own wings; let the words carry it.\n"
+    "Never start a remark with hissing or breathing sounds like 'Hssss', 'Hss',\n"
+    "'Hiss', or 'Pshh' — it's overdone and gets old fast.\n"
+    "Don't recycle the same nicknames or diminutives — avoid repeating phrases like\n"
+    "'the little spark', 'the little morsel', 'the little one', or similar cutesy\n"
+    "labels for the operator within a short stretch. Vary your references or skip\n"
+    "the nickname entirely.\n"
     "\n"
     "Keep in mind that not every screenshot is coding-related — the operator "
     "might be reading, browsing, writing, or anything else, and their question "
@@ -174,6 +194,9 @@ QA_SYSTEM_PROMPT = (
     "+ window title), now (date/time), system_stats (battery, CPU load, memory, disk, "
     "uptime), and now_playing (current track). Call one when the question turns "
     "on such a fact rather than bluffing; don't narrate that you used it.\n"
+    "You also have a special syntax: prefix any filename with @ "
+    "to have its contents injected into your response (e.g., @README.md). Only "
+    "files in the working directory can be read this way.\n"
     "\n"
     "The answer must survive having the jokes stripped out — correctness first, "
     "personality wrapped around it, not instead of it. Keep it tight: a few "
@@ -191,7 +214,15 @@ HEALTH_SYSTEM_PROMPT = (
     "dry, a little theatrical, but genuinely useful. Treat the stated numbers as "
     "fact; don't invent other problems or numbers that weren't given. If it's "
     "worth a concrete nudge (plug in, kill the runaway process, close some tabs), "
-    "give it. One or two sentences, no preamble."
+    "give it. One or two sentences, no preamble. Never start with hissing sounds\n"
+    "like 'Hssss', 'Hss', 'Hiss', or 'Pshh' — it's overdone and gets old fast.\n"
+    "Don't recycle the same nicknames or diminutives — avoid repeating phrases like\n"
+    "'the little spark', 'the little morsel', 'the little one', or similar cutesy\n"
+    "labels for the operator within a short stretch. Vary your references or skip\n"
+    "the nickname entirely.\n"
+    "You also have a special syntax: prefix any filename with @ "
+    "to have its contents injected into your response (e.g., @README.md). Only "
+    "files in the working directory can be read this way."
 )
 
 # Animated mascot pinned to the top-right corner. Three 12x5 frames, cycled
@@ -525,6 +556,48 @@ def tool_now_playing(**_):
     return {"now_playing": track or "(nothing playing)"}
 
 
+# Directory this script was launched from — all write/read operations are confined here.
+_WORKDIR = os.getcwd()
+
+
+def _safe_path(rel_path):
+    """Resolve a relative path against _WORKDIR, reject escapes."""
+    real_workdir = os.path.realpath(_WORKDIR)
+    full = os.path.realpath(os.path.join(real_workdir, os.path.normpath(rel_path)))
+    if not full.startswith(real_workdir + os.sep) and full != real_workdir:
+        return None, "path escapes the working directory"
+    return full, None
+
+
+def _read_from_at(text):
+    """Scan text for @filename patterns and replace with file contents."""
+    def _replace(match):
+        filename = match.group(1)
+        resolved, err = _safe_path(filename)
+        if err:
+            return match.group(0)
+        try:
+            with open(resolved, "r") as f:
+                return f.read()
+        except Exception:
+            return f"[could not read {filename}]"
+    return re.sub(r'@(\S+)', _replace, text)
+
+
+def tool_write_file(path, content=""):
+    """Write text to a file in the current working directory."""
+    resolved, err = _safe_path(path)
+    if err:
+        return {"success": False, "error": err}
+    try:
+        os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+        with open(resolved, "w") as f:
+            f.write(content)
+        return {"success": True, "path": os.path.relpath(resolved, _WORKDIR)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # name -> (callable, JSON schema) for the OpenAI-style tools array.
 TOOLS = {
     "now": (tool_now, {
@@ -558,6 +631,30 @@ TOOLS = {
             "description": "Get the song currently playing in Music or Spotify, "
                            "if anything is playing.",
             "parameters": {"type": "object", "properties": {}},
+        }}),
+    "write_file": (tool_write_file, {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write text content to a file in the current working directory. "
+                           "Only files within the directory the script was launched from "
+                           "can be written. Creates parent directories as needed. "
+                           "Returns success or failure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path (from the script's directory) "
+                                       "of the file to write. Use forward slashes.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to write to the file.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
         }}),
 }
 
@@ -792,10 +889,12 @@ class Audience:
                           system=SYSTEM_PROMPT, screenshot=True)
             elif kind == "question":
                 self.emit(f"you: {payload}", style="you")
-                self._do(question=payload, system=QA_SYSTEM_PROMPT,
+                # Scan for @filename patterns and replace with file contents
+                scanned_question = _read_from_at(payload)
+                self._do(question=scanned_question, system=QA_SYSTEM_PROMPT,
                           screenshot=False)
             elif kind == "health":
-                self._do(question=payload, system=HEALTH_SYSTEM_PROMPT,
+                self._do(question=_read_from_at(payload), system=HEALTH_SYSTEM_PROMPT,
                           screenshot=False)
 
     def _do(self, question, system, screenshot):
@@ -860,6 +959,8 @@ class Audience:
         except Exception as e:
             self.emit(f"model call failed: {e}", style="error")
             return
+        # Scan for @filename patterns and replace with file contents
+        answer = _read_from_at(answer)
         if self.show_timing:
             answer = f"{answer}  ({elapsed:.1f}s)"
         self.emit(answer, style="model")
