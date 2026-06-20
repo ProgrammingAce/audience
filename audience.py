@@ -190,9 +190,9 @@ QA_SYSTEM_PROMPT = (
     "+ window title), now (date/time), system_stats (battery, CPU load, memory, disk, "
     "uptime), and now_playing (current track). Call one when the question turns "
     "on such a fact rather than bluffing; don't narrate that you used it.\n"
-    "You also have a special syntax: prefix any filename with @ "
-    "to have its contents injected into your response (e.g., @README.md). Only "
-    "files in the working directory can be read this way.\n"
+    "When the operator prefixes a filename with @ (e.g., @README.md), that is a "
+    "request to read that file: call the read_file tool with that path before "
+    "answering. Only files in the working directory can be read.\n"
     "\n"
     "The answer must survive having the jokes stripped out — correctness first, "
     "personality wrapped around it, not instead of it. Keep it tight: a few "
@@ -395,11 +395,14 @@ def hamming(a, b):
 # --------------------------------------------------------------------------
 # Agent tools
 #
-# Read-only, local, low-sensitivity facts the model can pull to ground its
-# commentary instead of guessing from a fuzzy screenshot. Every tool here must
-# be safe even if the model is fully prompt-injected by an adversarial screen:
-# nothing reads secrets (clipboard, history, arbitrary files), writes, executes
-# shell input, or sends data off the machine.
+# Mostly read-only, local, low-sensitivity facts the model can pull to ground
+# its commentary instead of guessing from a fuzzy screenshot. The model can be
+# fully prompt-injected by an adversarial screen, so every tool here is built to
+# stay safe under that assumption: nothing reads secrets (clipboard, history),
+# executes shell input, or sends data off the machine. File access is confined
+# to the working directory; reads are size-capped, and writes can only create
+# new files — existing files are never overwritten — so an injected model can't
+# clobber source, build scripts, or anything already on disk.
 # --------------------------------------------------------------------------
 def tool_now(**_):
     """Current local date and time."""
@@ -552,26 +555,78 @@ def tool_now_playing(**_):
 # Directory this script was launched from — all write/read operations are confined here.
 _WORKDIR = os.getcwd()
 
+# Cap on file reads (and writes) so an injected model can't pull a multi-gigabyte
+# file into memory and the model context, or fill the disk.
+_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
+
 
 def _safe_path(rel_path):
-    """Resolve a relative path against _WORKDIR, reject escapes."""
+    """Resolve a relative path against _WORKDIR, reject escapes.
+
+    Uses commonpath (not a string prefix) so a sibling like /work-evil can't
+    masquerade as being inside /work, and normcase so the check matches the
+    filesystem's case-sensitivity (Windows treats paths case-insensitively).
+    realpath resolves symlinks before the check, so a symlink can't point out.
+    """
     real_workdir = os.path.realpath(_WORKDIR)
     full = os.path.realpath(os.path.join(real_workdir, os.path.normpath(rel_path)))
-    if not full.startswith(real_workdir + os.sep) and full != real_workdir:
+    try:
+        common = os.path.commonpath(
+            [os.path.normcase(full), os.path.normcase(real_workdir)])
+    except ValueError:
+        # raised when paths live on different drives (Windows) — can't be inside
+        return None, "path escapes the working directory"
+    if common != os.path.normcase(real_workdir):
         return None, "path escapes the working directory"
     return full, None
 
 
 def tool_write_file(path, content=""):
-    """Write text to a file in the current working directory."""
+    """Create a new file in the current working directory.
+
+    Refuses to overwrite anything that already exists: an adversarial screen can
+    prompt-inject the model, and a write tool that could clobber existing files
+    would let it rewrite source, configs, or git internals. New files only.
+    """
+    resolved, err = _safe_path(path)
+    if err:
+        return {"success": False, "error": err}
+    if len(content.encode("utf-8")) > _MAX_FILE_BYTES:
+        return {"success": False, "error": "content exceeds 50 MB limit"}
+    try:
+        if os.path.lexists(resolved):
+            return {"success": False,
+                    "error": "file already exists; overwriting is not allowed"}
+        os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+        # "x" mode fails if the path was created between the check and the open,
+        # closing the TOCTOU window rather than silently overwriting.
+        with open(resolved, "x") as f:
+            f.write(content)
+        return {"success": True, "path": os.path.relpath(resolved, _WORKDIR)}
+    except FileExistsError:
+        return {"success": False,
+                "error": "file already exists; overwriting is not allowed"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def tool_read_file(path, **_):
+    """Read text from a file in the current working directory."""
     resolved, err = _safe_path(path)
     if err:
         return {"success": False, "error": err}
     try:
-        os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
-        with open(resolved, "w") as f:
-            f.write(content)
-        return {"success": True, "path": os.path.relpath(resolved, _WORKDIR)}
+        if os.path.getsize(resolved) > _MAX_FILE_BYTES:
+            return {"success": False, "error": "file exceeds 50 MB limit"}
+        with open(resolved, "r") as f:
+            content = f.read()
+        lines = content.splitlines()
+        return {
+            "success": True,
+            "path": os.path.relpath(resolved, _WORKDIR),
+            "content": content,
+            "lines": len(lines),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -614,10 +669,11 @@ TOOLS = {
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write text content to a file in the current working directory. "
+            "description": "Create a NEW text file in the current working directory. "
                            "Only files within the directory the script was launched from "
-                           "can be written. Creates parent directories as needed. "
-                           "Returns success or failure.",
+                           "can be written, and only files that do not already exist — "
+                           "existing files are never overwritten. Creates parent "
+                           "directories as needed. Returns success or failure.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -632,6 +688,25 @@ TOOLS = {
                     },
                 },
                 "required": ["path", "content"],
+            },
+        }}),
+    "read_file": (tool_read_file, {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read text content from a file in the current working directory. "
+                           "Only files within the directory the script was launched from "
+                           "can be read. Returns the file content and line count.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path (from the script's directory) "
+                                       "of the file to read. Use forward slashes.",
+                    },
+                },
+                "required": ["path"],
             },
         }}),
 }

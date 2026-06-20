@@ -116,7 +116,7 @@ def _image_ahash(img):
     try:
         from PIL import Image
         gray = img.convert("L").resize((8, 8), Image.LANCZOS)
-        px = list(gray.get_flattened_data()[:8 * 8])
+        px = list(gray.getdata())[:8 * 8]
         mean = sum(px) / len(px)
         bits = 0
         for p in px:
@@ -350,6 +350,59 @@ def _now_playing():
 
 
 # --------------------------------------------------------------------------
+# File read/write — confined to the working directory
+# --------------------------------------------------------------------------
+
+_WORKDIR = os.getcwd()
+
+# Cap on file reads so an injected model can't pull a multi-gigabyte file into
+# memory and the model context.
+_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _safe_path(rel_path):
+    """Resolve a relative path against _WORKDIR, reject escapes.
+
+    Uses commonpath (not a string prefix) so a sibling like /work-evil can't
+    masquerade as being inside /work, and normcase so the check matches the
+    filesystem's case-sensitivity (Windows treats paths case-insensitively).
+    realpath resolves symlinks before the check, so a symlink can't point out.
+    """
+    real_workdir = os.path.realpath(_WORKDIR)
+    full = os.path.realpath(os.path.join(real_workdir, os.path.normpath(rel_path)))
+    try:
+        common = os.path.commonpath(
+            [os.path.normcase(full), os.path.normcase(real_workdir)])
+    except ValueError:
+        # raised when paths live on different drives (Windows) — can't be inside
+        return None, "path escapes the working directory"
+    if common != os.path.normcase(real_workdir):
+        return None, "path escapes the working directory"
+    return full, None
+
+
+def _read_file(path):
+    """Read text from a file in the current working directory."""
+    resolved, err = _safe_path(path)
+    if err:
+        return {"success": False, "error": err}
+    try:
+        if os.path.getsize(resolved) > _MAX_FILE_BYTES:
+            return {"success": False, "error": "file exceeds 50 MB limit"}
+        with open(resolved, "r") as f:
+            content = f.read()
+        lines = content.splitlines()
+        return {
+            "success": True,
+            "path": os.path.relpath(resolved, _WORKDIR),
+            "content": content,
+            "lines": len(lines),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
@@ -467,6 +520,10 @@ QA_SYSTEM_PROMPT = (
     "uptime), and now_playing (current track). Call one when the question turns "
     "on such a fact rather than bluffing; don't narrate that you used it.\n"
     "\n"
+    "When the operator prefixes a filename with @ (e.g., @README.md), that is a "
+    "request to read that file: call the read_file tool with that path before "
+    "answering. Only files in the working directory can be read.\n"
+    "\n"
     "The answer must survive having the jokes stripped out — correctness first, "
     "personality wrapped around it, not instead of it. Keep it tight: a few "
     "sentences, more only when the question truly earns it."
@@ -572,6 +629,25 @@ TOOLS = {
             "description": "Get the song currently playing in Spotify, "
                            "if anything is playing.",
             "parameters": {"type": "object", "properties": {}},
+        }}),
+    "read_file": (lambda **kwargs: _read_file(**kwargs), {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read text content from a file in the current working directory. "
+                           "Only files within the directory the script was launched from "
+                           "can be read. Returns the file content and line count.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path (from the script's directory) "
+                                       "of the file to read. Use forward slashes.",
+                    },
+                },
+                "required": ["path"],
+            },
         }}),
 }
 
