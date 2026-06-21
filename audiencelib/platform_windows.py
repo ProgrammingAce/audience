@@ -95,9 +95,7 @@ class WindowsPlatform(Platform):
     supports_write_file = True
 
     def __init__(self):
-        # Capture the foreground HWND *before* curses takes over so we know
-        # which window the operator was looking at when the script started.
-        self._start_hwnd = None
+        super().__init__()
         # stdout saved across the curses session (see enter_ui/exit_ui).
         self._saved_stdout = None
 
@@ -293,10 +291,12 @@ class WindowsPlatform(Platform):
         return ""
 
     # --- session / UI lifecycle -------------------------------------------
-    def begin_session(self):
-        self._start_hwnd = ctypes.windll.user32.GetForegroundWindow()
-
     def enter_ui(self):
+        # Ask the terminal to report focus changes (ESC[I / ESC[O) so the shared
+        # is_own_window logic knows when audience's own tab is focused. Emitted
+        # on the live stdout *before* the redirect below so it reaches the
+        # console. Windows Terminal supports DECSET 1004.
+        self._write_focus_reporting(True)
         # Redirect stdout to stderr while curses is running. PSReadline
         # (PowerShell) captures stdout writes and can render BEL escape
         # sequences as garbled glyphs in the input box. Curses writes directly
@@ -307,31 +307,27 @@ class WindowsPlatform(Platform):
     def exit_ui(self):
         if self._saved_stdout is not None:
             sys.stdout = self._saved_stdout
+        # Turn focus-reporting back off on the restored stdout.
+        self._write_focus_reporting(False)
 
-    def is_own_window(self):
-        """True if a screenshot now would catch the dragon watching itself."""
-        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+    # --- own-window detection: feed the shared base logic -----------------
+    def _frontmost_pid(self):
+        return _get_active_window_pid()
 
-        # If the user switched to a DIFFERENT window, it's safe to screenshot.
-        # If the same window is still on top the user clicked back to the dragon
-        # — skip.
-        if fg_hwnd != self._start_hwnd:
-            return False
-
-        # The same window handle is still on top, but it *might* be running a
-        # *different* process (e.g. the user closed the original PowerShell and
-        # opened another one that reused the same console handle). In that case
-        # it's safe to screenshot. We compare PIDs as a tie-breaker.
+    def _own_pids(self):
+        """Our PID and all ancestor PIDs (shell -> terminal app), cached once."""
+        if self._ancestors is not None:
+            return self._ancestors
+        pids = set()
         try:
-            start_pid = ctypes.wintypes.DWORD()
-            ctypes.windll.user32.GetWindowThreadProcessId(
-                self._start_hwnd, ctypes.byref(start_pid))
-            fg_pid = ctypes.wintypes.DWORD()
-            ctypes.windll.user32.GetWindowThreadProcessId(
-                fg_hwnd, ctypes.byref(fg_pid))
-            if start_pid.value != fg_pid.value:
-                return False
+            proc = psutil.Process(os.getpid())
+            for _ in range(20):
+                pids.add(proc.pid)
+                parent = proc.parent()
+                if parent is None or parent.pid in pids:
+                    break
+                proc = parent
         except Exception:
-            pass
-
-        return True
+            pids.add(os.getpid())
+        self._ancestors = pids
+        return pids

@@ -32,13 +32,6 @@ import Quartz
 
 from .platform_base import Platform
 
-# xterm focus-reporting (DECSET 1004): when enabled the terminal emits ESC[I
-# when audience's tab/window gains keyboard focus and ESC[O when it loses it.
-# That per-tab focus state is what tells us whether the dragon would be looking
-# at itself. Supported by iTerm2, Terminal.app, kitty, wezterm, alacritty.
-FOCUS_REPORTING_ON = "\033[?1004h"
-FOCUS_REPORTING_OFF = "\033[?1004l"
-
 # screencapture emits this on stderr when a target window can't be grabbed
 # (e.g. it closed between picking the id and capturing). It's expected, not an
 # error worth showing — everything else from screencapture is forwarded to the
@@ -110,14 +103,7 @@ class MacPlatform(Platform):
     supports_write_file = True
 
     def __init__(self):
-        # Whether audience's own tab holds keyboard focus. Driven by terminal
-        # focus-reporting events (ESC[I / ESC[O). Starts True: audience launches
-        # in the foreground, so assume focused until the terminal says otherwise.
-        self.focused = True
-        # Our process's ancestor PIDs (shell, terminal GUI app, ...), computed
-        # lazily once. Used to tell whether the frontmost app is our own
-        # terminal, as an independent cross-check on the focus flag.
-        self._ancestors = None
+        super().__init__()
 
     # --- capture & change detection ---------------------------------------
     def capture(self):
@@ -325,20 +311,19 @@ class MacPlatform(Platform):
     def enter_ui(self):
         # Ask the terminal to report focus changes (ESC[I / ESC[O) so we know
         # when audience's own tab is the focused one.
-        sys.stdout.write(FOCUS_REPORTING_ON)
-        sys.stdout.flush()
+        self._write_focus_reporting(True)
 
     def exit_ui(self):
         # Always turn focus-reporting back off so the terminal doesn't keep
         # echoing focus codes afterward.
-        sys.stdout.write(FOCUS_REPORTING_OFF)
-        sys.stdout.flush()
+        self._write_focus_reporting(False)
 
-    def note_focus(self, focused):
-        self.focused = focused
+    # --- own-window detection: feed the shared base logic -----------------
+    def _frontmost_pid(self):
+        return _frontmost_pid()
 
-    def _ancestor_pids(self):
-        """Set of our PID and all ancestor PIDs (shell -> terminal app)."""
+    def _own_pids(self):
+        """Our PID and all ancestor PIDs (shell -> terminal app), cached once."""
         if self._ancestors is not None:
             return self._ancestors
         pids, pid = set(), os.getpid()
@@ -355,18 +340,3 @@ class MacPlatform(Platform):
             pid = ppid
         self._ancestors = pids
         return pids
-
-    def is_own_window(self):
-        """True if a screenshot now would catch the dragon watching itself.
-
-        Primary signal is terminal focus-reporting (self.focused), which tracks
-        focus at the tab level. But that flag goes stale if a focus-out event is
-        ever dropped, which would pause screenshots forever. So we cross-check:
-        if the frontmost window belongs to some app that isn't our terminal
-        (its owner PID isn't one of our ancestors), we're plainly not looking at
-        ourselves and can shoot regardless of a stale focus flag.
-        """
-        fg = _frontmost_pid()
-        if fg is not None and fg not in self._ancestor_pids():
-            return False
-        return self.focused
