@@ -219,10 +219,13 @@ def build_tools(platform):
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "Save a durable, useful fact about the operator to "
-                               "long-term memory so you recall it in future sessions "
-                               "(e.g. their name, what they're building, tools they "
-                               "favor, a stated preference). One crisp fact per call. "
+                "description": "Save a durable, useful fact to long-term memory so "
+                               "you recall it in future sessions (e.g. a name, what "
+                               "they're building, tools they favor, a stated "
+                               "preference). One crisp fact per call. Set `subject` "
+                               "to say WHOSE fact it is: 'operator' (default) for a "
+                               "fact about the operator, 'self' for a fact about YOU, "
+                               "the dragon — keep your own name separate from theirs. "
                                "Do NOT store ephemeral state (battery, what's on "
                                "screen now) or secrets/passwords/tokens.",
                 "parameters": {
@@ -236,6 +239,14 @@ def build_tools(platform):
                             "type": "string",
                             "description": "Optional short label, e.g. 'project', "
                                            "'preference', 'identity'.",
+                        },
+                        "subject": {
+                            "type": "string",
+                            "enum": ["operator", "self"],
+                            "description": "Whose fact this is: 'operator' (default) "
+                                           "for the operator, 'self' for the dragon "
+                                           "itself. A name the operator gives is the "
+                                           "operator's, not yours.",
                         },
                         "confidence": {
                             "type": "number",
@@ -253,11 +264,13 @@ def build_tools(platform):
             "type": "function",
             "function": {
                 "name": "recall",
-                "description": "Search long-term memory for facts about the operator. "
-                               "Use before answering when they ask what you remember, "
-                               "or to check whether something is already saved. Returns "
-                               "matching memories with their ids. Empty query returns "
-                               "everything remembered.",
+                "description": "Search long-term memory. Use before answering when "
+                               "they ask what you remember, or to check whether "
+                               "something is already saved. Returns matching memories "
+                               "with their ids and subject. Empty query returns "
+                               "everything remembered. Pass `subject` to look at only "
+                               "the operator's facts or only your own — e.g. answer "
+                               "'what is your name?' with subject='self'.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -265,6 +278,12 @@ def build_tools(platform):
                             "type": "string",
                             "description": "Keyword to match against remembered text "
                                            "and categories. Omit to list all.",
+                        },
+                        "subject": {
+                            "type": "string",
+                            "enum": ["operator", "self"],
+                            "description": "Limit to facts about the operator or about "
+                                           "the dragon itself. Omit to search both.",
                         },
                     },
                 },

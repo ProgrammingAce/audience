@@ -84,6 +84,101 @@ def test_forget_unknown_id(memory_dir):
     assert not core.tool_forget(id="deadbeef")["success"]
 
 
+def test_remember_records_first_seen(memory_dir):
+    core.tool_remember(text="a dated fact")
+    entry = core.read_long_term()[0]
+    assert entry["first_seen"] == entry["ts"]
+
+
+def test_auto_pin_stated_identity(memory_dir):
+    r = core.tool_remember(text="the operator is named Ace",
+                           category="identity", source="stated")
+    assert r["pinned"] is True
+    assert core.read_long_term()[0].get("pinned") is True
+
+
+def test_no_auto_pin_for_inferred_or_other_category(memory_dir):
+    # Same identity category but only inferred from a screenshot — not an absolute.
+    r1 = core.tool_remember(text="screen seems to show a name", category="identity",
+                            source="inferred")
+    # Stated, but not an identity fact — also not auto-pinned.
+    r2 = core.tool_remember(text="uses Rust", category="stack", source="stated")
+    assert not r1["pinned"]
+    assert not r2["pinned"]
+
+
+def test_set_pinned_toggles(memory_dir):
+    mem_id = core.tool_remember(text="a plain fact")["id"]
+    assert core.read_long_term()[0].get("pinned") is None
+    assert core.set_pinned(mem_id, True)["pinned"] is True
+    assert core.read_long_term()[0].get("pinned") is True
+    assert core.set_pinned(mem_id, False)["pinned"] is False
+    assert core.read_long_term()[0].get("pinned") is None
+
+
+def test_set_pinned_unknown_id(memory_dir):
+    assert not core.set_pinned("deadbeef", True)["success"]
+
+
+def test_pin_peer_fact_via_local_shadow(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    mem_id = core.tool_remember(text="peer-only fact")["id"]
+    # A different machine pins it; it must not rewrite the peer's shard, so it
+    # writes a pinned shadow locally and the union read ORs the pin in.
+    _as_machine(monkeypatch, "desktop")
+    assert core.set_pinned(mem_id, True)["pinned"] is True
+    pinned = [m for m in core.read_long_term() if m.get("id") == mem_id][0]
+    assert pinned.get("pinned") is True
+
+
+def test_edit_memory_changes_text_and_preserves_metadata(memory_dir):
+    old_id = core.tool_remember(text="operator likes tea", category="preference",
+                                confidence=0.8, source="stated")["id"]
+    res = core.edit_memory(old_id, "operator likes strong coffee")
+    assert res["success"] and res["id"] != old_id
+    live = core.read_long_term()
+    assert len(live) == 1
+    m = live[0]
+    assert m["text"] == "operator likes strong coffee"
+    assert m["category"] == "preference"
+    assert m["confidence"] == 0.9            # carried over, not reset
+    # the old text is tombstoned and no longer recalled
+    assert core.tool_recall(query="tea")["count"] == 0
+
+
+def test_edit_memory_preserves_pin_and_first_seen(memory_dir):
+    mid = core.tool_remember(text="the operator is named Ace", category="identity",
+                             source="stated")["id"]  # auto-pinned
+    first_seen = next(m for m in core.read_long_term()
+                      if m["id"] == mid)["first_seen"]
+    new_id = core.edit_memory(mid, "the operator is named Ace the Great")["id"]
+    m = next(m for m in core.read_long_term() if m["id"] == new_id)
+    assert m.get("pinned") is True
+    assert m["first_seen"] == first_seen      # age clock not reset by the edit
+
+
+def test_edit_memory_noop_when_text_unchanged(memory_dir):
+    mid = core.tool_remember(text="unchanged fact")["id"]
+    res = core.edit_memory(mid, "unchanged fact")
+    assert res["success"] and res["id"] == mid
+    assert len(core.read_long_term()) == 1
+
+
+def test_edit_memory_rejects_collision_with_another_fact(memory_dir):
+    a = core.tool_remember(text="first fact")["id"]
+    core.tool_remember(text="second fact")
+    res = core.edit_memory(a, "second fact")   # would collide with an existing one
+    assert not res["success"]
+    assert "already" in res["error"]
+    assert core.tool_recall(query="")["count"] == 2  # nothing changed
+
+
+def test_edit_memory_missing_id_and_empty_text(memory_dir):
+    mid = core.tool_remember(text="some fact")["id"]
+    assert not core.edit_memory("deadbeef", "new")["success"]
+    assert not core.edit_memory(mid, "   ")["success"]   # empty after strip
+
+
 def test_gold_adjust_and_total(memory_dir):
     assert core.tool_gold_total()["total"] == 0
     r = core.tool_adjust_gold(amount=10)
@@ -164,3 +259,15 @@ def test_gold_ledger_sums_across_machines(memory_dir, monkeypatch):
     core.tool_adjust_gold(amount=-3)
     # Both machines' deltas survive and the total is their sum.
     assert core.tool_gold_total()["total"] == 7
+
+
+def test_edit_a_peers_memory_without_rewriting_its_shard(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    old_id = core.tool_remember(text="a peer wrote this")["id"]
+    # A different machine edits it; the peer shard stays intact (edit-as-tombstone),
+    # and the union reflects the corrected text.
+    _as_machine(monkeypatch, "desktop")
+    assert core.edit_memory(old_id, "desktop corrected this")["success"]
+    assert {m["text"] for m in core.read_long_term()} == {"desktop corrected this"}
+    import os
+    assert os.path.exists(os.path.join(str(memory_dir), "long_term.laptop.jsonl"))

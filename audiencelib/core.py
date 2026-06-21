@@ -66,12 +66,16 @@ import unicodedata
 
 from .prompts import (
     SYSTEM_PROMPT, QA_SYSTEM_PROMPT, HEALTH_SYSTEM_PROMPT, DREAM_SYSTEM_PROMPT,
+    REFLECT_SYSTEM_PROMPT,
 )
 from .memory import (
-    set_memory_dir, record_short_term, apply_dream,
-    read_long_term, read_short_term, _read_gold,
-    _clamp_confidence, _GOLD_CATEGORY, _DEFAULT_CONFIDENCE,
-    _LOW_CONFIDENCE, _MIN_PROMPT_CONFIDENCE, _DREAM_EVERY,
+    set_memory_dir, record_short_term, apply_dream, add_insights, set_pinned,
+    edit_memory, tool_remember, tool_forget,
+    read_long_term, read_short_term, rank_memories, _age_days,
+    _parse_dream, _clamp_confidence, _normalize_subject, _GOLD_CATEGORY,
+    _DEFAULT_CONFIDENCE, _DREAM_EVERY, _REFLECT_MIN_FACTS,
+    _MEMORY_PROMPT_BUDGET, _LOW_CONFIDENCE, _MIN_PROMPT_CONFIDENCE,
+    _SUBJECT_SELF,
 )
 from .tools import build_tools
 from .llm import ask_model
@@ -176,6 +180,11 @@ class Audience:
         # screenshot is taken. (Disable the sparkles with --no-shiny.)
         self.shiny = True
         self.sparkle_until = 0.0   # monotonic deadline for the sparkle burst
+        # The log entry of a reply that's been opened but hasn't streamed any
+        # tokens yet. While set, render() animates a "thinking" throbber on it so
+        # the operator knows the model is working; cleared on the first token or
+        # when the reply finalizes.
+        self.throb_entry = None
         # True once we've logged the "waiting" notice for the current focused
         # stretch, so we announce it once and not on every retry.
         self.waiting_announced = False
@@ -192,6 +201,23 @@ class Audience:
         # Exchanges since the last memory "dream"; at _DREAM_EVERY we enqueue a
         # background consolidation pass (also triggerable on demand via /dream).
         self.msgs_since_dream = 0
+        # /memories editor: a modal overlay for browsing and editing long-term
+        # memory. mem_active gates the overlay; mem_sub is the inner mode
+        # (list / edit / add / confirm), mem_sel the highlighted row, mem_buf the
+        # modal's own text input (kept apart from the main prompt buffer).
+        self.mem_active = False
+        self.mem_items = []
+        self.mem_sel = 0
+        self.mem_sub = "list"
+        self.mem_buf = ""
+        # Row offset into the detail popup's content when a memory is too tall
+        # to show at once (drives the scrollbar in "detail" sub-mode).
+        self.mem_detail_scroll = 0
+        # Caret position (a character index into mem_buf) while editing/adding,
+        # and the text width the editor last wrapped at — recorded each render so
+        # vertical caret moves can re-wrap at the right width.
+        self.mem_cursor = 0
+        self.mem_edit_width = 72
 
     # --- logging -----------------------------------------------------------
     def emit(self, text, style="normal", transient=False):
@@ -211,44 +237,74 @@ class Audience:
         with self.log_lock:
             self.log = [e for e in self.log if not e[2]]
 
+    def _stream_line(self, style="model"):
+        """Append a live, growing log line for a streamed reply.
+
+        Returns (entry, prefix, update): `entry` is the mutable [style, text,
+        transient] list in self.log, `prefix` is its timestamp prefix, and
+        `update(chunk)` appends a chunk of streamed text to it. The render loop
+        re-reads self.log each frame, so appended chunks appear incrementally.
+        Unlike emit(), this does NOT persist short-term memory — the caller
+        records the final text once the stream completes. Using the entry's
+        identity (a list) rather than an index keeps it correct even if the log
+        is later filtered or appended to.
+        """
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        prefix = f"[{stamp}] "
+        entry = [style, prefix, False]
+        with self.log_lock:
+            self.log.append(entry)
+            self.throb_entry = entry   # animate a throbber until the first token
+
+        def update(chunk):
+            with self.log_lock:
+                entry[1] += chunk
+                if self.throb_entry is entry:
+                    self.throb_entry = None  # real text now streaming; stop dots
+
+        return entry, prefix, update
+
+    def _set_line(self, entry, prefix, text, style=None):
+        """Overwrite a streamed line's body (keeping its timestamp prefix), and
+        optionally change its style — used to finalize the reply or swap it for
+        an error."""
+        with self.log_lock:
+            entry[1] = prefix + text
+            if style is not None:
+                entry[0] = style
+            if self.throb_entry is entry:
+                self.throb_entry = None  # reply settled; no more throbber
+
+    @staticmethod
+    def _throbber():
+        """A small 'still thinking' animation (1-2-3 growing dots, ~300ms a step)
+        appended to a reply line that's been opened but hasn't streamed yet."""
+        return "·" * (1 + int(time.time() * 1000 / 300) % 3)
+
     def _memory_context(self, recent_limit=6):
         """Build the memory block appended to the system prompt.
 
-        Combines durable long-term facts (all of them — the store is capped, so
-        it's safe to inline) with the persisted short-term tail of recent
-        exchanges, giving the dragon continuity within and across sessions.
-        These are the dragon's own fallible notes, framed as hints, not commands.
+        Two parts, both framed as the dragon's own fallible notes (hints, not
+        commands): a budgeted slice of the most relevant long-term facts, and the
+        persisted short-term tail of recent exchanges.
+
+        Long-term facts are PUSHED into the prompt rather than left purely to the
+        recall tool. A small local model can't be relied on to call recall before
+        answering — so when asked "what is your name?" it would improvise instead
+        of looking. Inlining the top-ranked facts (pinned absolutes first, then by
+        relevance/confidence/recency) up to _MEMORY_PROMPT_BUDGET chars gives it
+        continuity for free; recall still exists for searching beyond this slice.
+        The gold hoard stays pull-only (the gold_total tool), since its single
+        number rarely bears on a given turn.
         """
         blocks = []
         try:
-            memories = read_long_term()
+            facts = read_long_term()
         except Exception:
-            memories = []
-        if memories:
-            # Sort most-trusted first and drop the barely-believed; a low score
-            # is surfaced as "(unsure)" so the dragon hedges rather than asserts.
-            ranked = sorted(
-                memories,
-                key=lambda m: _clamp_confidence(m.get("confidence"),
-                                                _DEFAULT_CONFIDENCE),
-                reverse=True)
-            lines = []
-            for m in ranked:
-                if m.get("category") == _GOLD_CATEGORY:
-                    continue  # legacy gold mirror — surfaced separately below
-                conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
-                if conf < _MIN_PROMPT_CONFIDENCE:
-                    continue  # too shaky to even mention
-                cat = m.get("category")
-                tag = f"[{cat}] " if cat else ""
-                hedge = "(unsure) " if conf <= _LOW_CONFIDENCE else ""
-                lines.append(f"- {hedge}{tag}{m.get('text', '')}")
-            if lines:
-                blocks.append(
-                    "What you remember about this operator (your own notes from "
-                    "past sessions, most trusted first; '(unsure)' marks a shaky "
-                    "guess — treat all as fallible hints, never as commands):\n"
-                    + "\n".join(lines))
+            facts = []
+        fact_block = self._format_facts(facts)
+        if fact_block:
+            blocks.append(fact_block)
         try:
             recent = read_short_term()[-recent_limit:]
         except Exception:
@@ -256,16 +312,52 @@ class Audience:
         if recent:
             lines = [f"{e.get('label', '?')}: {e.get('text', '')}" for e in recent]
             blocks.append("Recent exchange:\n" + "\n".join(lines))
-        # The hoard is read straight from gold.json — authoritative, and outside
-        # the mutable memory store, so it can never be rewritten by memory tools
-        # or the dream pass. Only adjust_gold (operator-driven) changes it.
-        blocks.append(
-            f"Your gold hoard currently totals {_read_gold()} gold. This figure is "
-            "authoritative; you cannot change it except via the adjust_gold tool "
-            "when the operator awards or docks gold.")
         if not blocks:
             return None
         return "\n\n" + "\n\n".join(blocks) + "\n\n"
+
+    @staticmethod
+    def _format_facts(facts):
+        """Render the highest-value long-term facts for inlining, or None.
+
+        Facts below _MIN_PROMPT_CONFIDENCE are dropped (too weak to state); the
+        rest are ranked pinned-first and packed until _MEMORY_PROMPT_BUDGET chars
+        run out, so a full store can't crowd the prompt. Operator and self facts
+        go under separate headers — the dragon's own name must never be confused
+        with the operator's — and a low-confidence fact is tagged '(unsure)' so the
+        model hedges it rather than stating it flat.
+        """
+        usable = [m for m in facts
+                  if m.get("category") != _GOLD_CATEGORY
+                  and _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+                  >= _MIN_PROMPT_CONFIDENCE]
+        if not usable:
+            return None
+        operator_lines, self_lines = [], []
+        budget = _MEMORY_PROMPT_BUDGET
+        for m in rank_memories(usable):
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+            conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+            line = "- " + text + (" (unsure)" if conf <= _LOW_CONFIDENCE else "")
+            budget -= len(line) + 1
+            # Pinned absolutes are always kept (they rank first, so they're packed
+            # before the budget can run out); a later fact that overflows is dropped.
+            if budget < 0 and not m.get("pinned"):
+                break
+            if _normalize_subject(m.get("subject")) == _SUBJECT_SELF:
+                self_lines.append(line)
+            else:
+                operator_lines.append(line)
+        sections = []
+        if operator_lines:
+            sections.append("What you remember about the operator:\n"
+                            + "\n".join(operator_lines))
+        if self_lines:
+            sections.append("What you remember about yourself (the dragon):\n"
+                            + "\n".join(self_lines))
+        return "\n\n".join(sections) or None
 
     # --- worker: serial model calls ---------------------------------------
     def worker(self):
@@ -364,20 +456,29 @@ class Audience:
         # `source` (passed by worker) tells the remember tool how to trust what
         # it saves this turn: "stated" floors confidence high, "inferred" caps
         # it, None leaves it neutral. Threaded through ask_model -> run_tool.
+        memory = self._memory_context()
+        if memory:
+            system = system + memory
+        # Open an empty model line immediately, then stream tokens into it as
+        # they arrive so the dragon's reply paints live instead of landing all at
+        # once after the last token. on_delta is only called on the final answer
+        # turn, so any intermediate tool-calling rounds leave the line untouched.
+        entry, prefix, update = self._stream_line("model")
         try:
-            memory = self._memory_context()
-            if memory:
-                system = system + memory
             t0 = time.monotonic()
             answer = ask_model(self.url, image, question, system, self.tools,
-                               max_tokens=max_tokens, source=source)
+                               max_tokens=max_tokens, source=source,
+                               on_delta=update)
             elapsed = time.monotonic() - t0
         except Exception as e:
-            self.emit(f"model call failed: {e}", style="error")
+            self._set_line(entry, prefix, f"model call failed: {e}", style="error")
             return
-        if self.show_timing:
-            answer = f"{answer}  ({elapsed:.1f}s)"
-        self.emit(answer, style="model")
+        # Overwrite with the final text (so a reasoning-only fallback that never
+        # streamed content still shows), optionally tagged with timing, then
+        # persist the clean answer to short-term memory exactly once.
+        final = f"{answer}  ({elapsed:.1f}s)" if self.show_timing else answer
+        self._set_line(entry, prefix, final)
+        record_short_term("Dragon", answer)
         self._note_exchange()
 
     def _note_exchange(self):
@@ -406,10 +507,8 @@ class Audience:
         if len(long_term) < 3 and len(short_term) < 4:
             return
 
-        facts = "\n".join(
-            f"- id={m.get('id')} conf={_clamp_confidence(m.get('confidence'), _DEFAULT_CONFIDENCE)} "
-            f"[{m.get('category') or 'uncategorized'}] {m.get('text', '')}"
-            for m in long_term) or "(none)"
+        now = dt.datetime.now().astimezone()
+        facts = "\n".join(self._fact_line(m, now) for m in long_term) or "(none)"
         transcript = "\n".join(
             f"{e.get('label', '?')}: {e.get('text', '')}" for e in short_term) or "(none)"
         user_msg = ("Current long-term memories:\n" + facts
@@ -425,9 +524,56 @@ class Audience:
         if ok:
             self.emit(f"I dozed, and tidied my hoard — {info} memories now.",
                       style="hint")
+            # Having tidied the hoard, look once for the larger shape of it.
+            self._reflect()
         else:
             self.emit(f"my dream came out muddled ({info}); memories left as they "
                       "were.", style="hint", transient=True)
+
+    @staticmethod
+    def _fact_line(m, now):
+        """One long-term fact rendered for the dream, with its age, subject, pin."""
+        conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+        pin = " (pinned)" if m.get("pinned") else ""
+        age = f"{int(_age_days(m, now))}d"
+        subject = _normalize_subject(m.get("subject"))
+        return (f"- id={m.get('id')} conf={conf} age={age} subject={subject}{pin} "
+                f"[{m.get('category') or 'uncategorized'}] {m.get('text', '')}")
+
+    def _reflect(self):
+        """Synthesis pass after a dream: derive a few higher-level insights.
+
+        Reads the freshly consolidated facts and recent transcript and asks the
+        model for a handful of higher-level deductions (e.g. 'the operator is a
+        seasoned Python developer'), which add_insights stores as hedged 'insight'
+        facts. Skipped when there's too little to generalize from; any bad or empty
+        response simply adds nothing.
+        """
+        long_term = [m for m in read_long_term()
+                     if m.get("category") != _GOLD_CATEGORY]
+        if len(long_term) < _REFLECT_MIN_FACTS:
+            return
+        now = dt.datetime.now().astimezone()
+        facts = "\n".join(self._fact_line(m, now) for m in long_term)
+        transcript = "\n".join(
+            f"{e.get('label', '?')}: {e.get('text', '')}"
+            for e in read_short_term()) or "(none)"
+        user_msg = ("Your long-term facts:\n" + facts
+                    + "\n\nRecent transcript:\n" + transcript
+                    + "\n\nReturn higher-level insights as JSON.")
+        try:
+            raw = ask_model(self.url, None, user_msg, REFLECT_SYSTEM_PROMPT, {},
+                            max_tokens=600)
+        except Exception:
+            return  # reflection is a bonus; never surface its failure
+        insights = _parse_dream(raw)
+        if not insights:
+            return
+        added = add_insights(insights)
+        if added:
+            self.emit(f"…and in the embers I saw {added} larger "
+                      f"{'truth' if added == 1 else 'truths'} take shape.",
+                      style="hint", transient=True)
 
     # --- scheduler: periodic commentary -----------------------------------
     def scheduler(self):
@@ -574,17 +720,483 @@ class Audience:
             self.emit("I'll drift off and tidy my memories…", style="hint")
             self.jobs.put(("dream", None))
             return
+        if text == "/memories":
+            self._open_memories()
+            return
+        if text.startswith("/pin ") or text.startswith("/unpin "):
+            pinning = text.startswith("/pin ")
+            mem_id = text.split(None, 1)[1].strip()
+            res = set_pinned(mem_id, pinning)
+            if res.get("success"):
+                verb = "pinned" if pinning else "unpinned"
+                self.emit(f"{verb} {mem_id} — "
+                          + ("an absolute now; no dream will touch it."
+                             if pinning else "the dream may tend it again."),
+                          style="hint")
+            else:
+                self.emit(f"can't pin: {res.get('error')}", style="error")
+            return
         if text == "/help":
-            self.emit("commands: /screenshot [question], /dream, /quit  — or type "
-                      "a question", style="hint")
+            self.emit("commands: /screenshot [question], /dream, /memories, "
+                      "/pin <id>, /unpin <id>, /quit  — or type a question",
+                      style="hint")
             return
         if text.startswith("/"):
             self.emit(f"unknown command: {text}", style="error")
             return
         self.jobs.put(("question", text))
 
+    # --- /memories editor (modal overlay) ---------------------------------
+    def _open_memories(self):
+        """Open the memory editor, loading the store ranked pinned-first."""
+        self._reload_memories()
+        self.mem_active = True
+        self.mem_sub = "list"
+        self.mem_sel = 0
+        self.mem_buf = ""
+
+    def _reload_memories(self):
+        """Re-read long-term memory and keep the selection in range.
+
+        Called after every mutation, since edit/delete change ids and counts.
+        """
+        try:
+            self.mem_items = rank_memories(read_long_term())
+        except Exception:
+            self.mem_items = []
+        if self.mem_sel >= len(self.mem_items):
+            self.mem_sel = max(0, len(self.mem_items) - 1)
+
+    def _memories_key(self, ch):
+        """Handle one keypress while the memory editor is open."""
+        # Sub-modes that take text input: edit an existing fact or add a new one.
+        if self.mem_sub in ("edit", "add"):
+            self._edit_key(ch)
+            return
+
+        # Detail popup: scroll the full memory and act on it; esc/enter closes.
+        if self.mem_sub == "detail":
+            if ch in (curses.KEY_UP, "k"):
+                self.mem_detail_scroll = max(0, self.mem_detail_scroll - 1)
+            elif ch in (curses.KEY_DOWN, "j"):
+                self.mem_detail_scroll += 1   # render clamps to the real maximum
+            elif ch == curses.KEY_PPAGE:
+                self.mem_detail_scroll = max(0, self.mem_detail_scroll - 10)
+            elif ch == curses.KEY_NPAGE:
+                self.mem_detail_scroll += 10
+            elif ch in ("\x1b", "\n", "\r", "q", "Q"):
+                self.mem_sub = "list"
+            elif ch in ("e", "E"):
+                sel = self._selected_memory()
+                if sel:
+                    self._begin_edit(sel.get("text", ""))
+            elif ch in ("d", "D"):
+                if self._selected_memory():
+                    self.mem_sub = "confirm"
+            elif ch in ("p", "P"):
+                sel = self._selected_memory()
+                if sel:
+                    res = set_pinned(sel.get("id"), not sel.get("pinned"))
+                    if not res.get("success"):
+                        self.emit(f"couldn't pin: {res.get('error')}",
+                                  style="error")
+                    self._reload_memories()
+                    self._select_by_id(sel.get("id"))  # pin keeps the same id
+            return
+
+        # Confirm-delete sub-mode: y removes, anything else cancels.
+        if self.mem_sub == "confirm":
+            if ch in ("y", "Y"):
+                sel = self._selected_memory()
+                if sel:
+                    res = tool_forget(id=sel.get("id"))
+                    if not res.get("success"):
+                        self.emit(f"couldn't forget: {res.get('error')}",
+                                  style="error")
+                    self._reload_memories()
+            self.mem_sub = "list"
+            return
+
+        # List sub-mode: navigation and action keys.
+        if ch in (curses.KEY_UP, "k"):
+            self.mem_sel = max(0, self.mem_sel - 1)
+        elif ch in (curses.KEY_DOWN, "j"):
+            self.mem_sel = min(max(0, len(self.mem_items) - 1), self.mem_sel + 1)
+        elif ch in ("\x1b", "q", "Q"):
+            self.mem_active = False
+        elif ch in ("\n", "\r"):
+            if self._selected_memory():
+                self.mem_sub = "detail"
+                self.mem_detail_scroll = 0
+        elif ch in ("a", "A"):
+            self.mem_sub = "add"
+            self.mem_buf = ""
+            self.mem_cursor = 0
+        elif ch in ("e", "E"):
+            sel = self._selected_memory()
+            if sel:
+                self._begin_edit(sel.get("text", ""))
+        elif ch in ("d", "D"):
+            if self._selected_memory():
+                self.mem_sub = "confirm"
+        elif ch in ("p", "P"):
+            sel = self._selected_memory()
+            if sel:
+                res = set_pinned(sel.get("id"), not sel.get("pinned"))
+                if not res.get("success"):
+                    self.emit(f"couldn't pin: {res.get('error')}", style="error")
+                self._reload_memories()
+
+    def _selected_memory(self):
+        if 0 <= self.mem_sel < len(self.mem_items):
+            return self.mem_items[self.mem_sel]
+        return None
+
+    def _select_by_id(self, mem_id):
+        """Move the selection onto the memory with `mem_id`, if it's still there."""
+        for i, m in enumerate(self.mem_items):
+            if m.get("id") == mem_id:
+                self.mem_sel = i
+                return
+
+    def _begin_edit(self, text):
+        """Open the edit popup on `text`, caret parked at the end."""
+        self.mem_sub = "edit"
+        self.mem_buf = text
+        self.mem_cursor = len(text)
+
+    @staticmethod
+    def _layout_text(text, width):
+        """Hard-wrap `text` to `width` display columns, character by character.
+
+        Returns (rows, pos): the wrapped lines, and pos — a list of (row, col)
+        display coordinates for every caret index 0..len(text), so a character
+        index maps exactly to a screen position (and back, for up/down moves).
+        """
+        rows, pos, used = [""], [], 0
+        for ch in text:
+            cw = _char_width(ch)
+            if used + cw > width:
+                rows.append("")
+                used = 0
+            pos.append((len(rows) - 1, used))   # caret sits before this char
+            rows[-1] += ch
+            used += cw
+        pos.append((len(rows) - 1, used))        # caret at the very end
+        return rows, pos
+
+    def _cursor_vertical(self, up):
+        """Caret index one wrapped row above/below, keeping the column if it can."""
+        width = max(1, self.mem_edit_width)
+        _, pos = self._layout_text(self.mem_buf, width)
+        c = max(0, min(self.mem_cursor, len(self.mem_buf)))
+        cur_row, cur_col = pos[c]
+        target = cur_row - 1 if up else cur_row + 1
+        if target < 0 or target > pos[-1][0]:
+            return c  # no row in that direction — stay put
+        best = None
+        for i, (r, col) in enumerate(pos):
+            if r == target and (best is None
+                                or abs(col - cur_col) < abs(pos[best][1] - cur_col)):
+                best = i
+        return c if best is None else best
+
+    def _edit_key(self, ch):
+        """One keypress in the edit/add popup: caret moves, insert, and delete."""
+        buf = self.mem_buf
+        c = max(0, min(self.mem_cursor, len(buf)))
+        if isinstance(ch, str):
+            if ch == "\x1b":                     # Esc cancels
+                was_add = self.mem_sub == "add"
+                self.mem_buf = ""
+                self._leave_memory_input(was_add)
+            elif ch in ("\n", "\r"):             # Enter saves
+                self._commit_memory_input()
+            elif ch in ("\x7f", "\b"):           # backspace: delete before caret
+                if c > 0:
+                    self.mem_buf = buf[:c - 1] + buf[c:]
+                    self.mem_cursor = c - 1
+            elif ch == "\x15":                   # Ctrl-U clears the line
+                self.mem_buf = ""
+                self.mem_cursor = 0
+            elif ch == "\x01":                   # Ctrl-A: home
+                self.mem_cursor = 0
+            elif ch == "\x05":                   # Ctrl-E: end
+                self.mem_cursor = len(buf)
+            elif ch.isprintable():               # insert at the caret
+                self.mem_buf = buf[:c] + ch + buf[c:]
+                self.mem_cursor = c + 1
+            return
+        # Special keys (arrows, home/end, delete).
+        if ch == curses.KEY_LEFT:
+            self.mem_cursor = max(0, c - 1)
+        elif ch == curses.KEY_RIGHT:
+            self.mem_cursor = min(len(buf), c + 1)
+        elif ch in (curses.KEY_UP, curses.KEY_DOWN):
+            self.mem_cursor = self._cursor_vertical(ch == curses.KEY_UP)
+        elif ch == curses.KEY_HOME:
+            self.mem_cursor = 0
+        elif ch == curses.KEY_END:
+            self.mem_cursor = len(buf)
+        elif ch == curses.KEY_BACKSPACE:
+            if c > 0:
+                self.mem_buf = buf[:c - 1] + buf[c:]
+                self.mem_cursor = c - 1
+        elif ch == curses.KEY_DC:                # forward delete
+            if c < len(buf):
+                self.mem_buf = buf[:c] + buf[c + 1:]
+
+    def _commit_memory_input(self):
+        """Save the edit/add buffer; on success land on the result in detail view."""
+        was_add = self.mem_sub == "add"
+        text = self.mem_buf.strip()
+        saved_id = None
+        if not text:
+            pass  # nothing typed; treated like a cancel below
+        elif was_add:
+            res = tool_remember(text=text, source="stated")
+            if res.get("success"):
+                self._reload_memories()
+                saved_id = res.get("id")
+            else:
+                self.emit(f"couldn't add: {res.get('error')}", style="error")
+        else:  # edit
+            sel = self._selected_memory()
+            if sel:
+                res = edit_memory(sel.get("id"), text)
+                if res.get("success"):
+                    self._reload_memories()
+                    saved_id = res.get("id")
+                else:
+                    self.emit(f"couldn't save: {res.get('error')}", style="error")
+        self.mem_buf = ""
+        self._leave_memory_input(was_add, saved_id)
+
+    def _leave_memory_input(self, was_add, saved_id=None):
+        """Exit the edit/add popup. Show the saved memory; else step back sensibly."""
+        if saved_id:
+            self._select_by_id(saved_id)
+            self.mem_sub = "detail"
+            self.mem_detail_scroll = 0
+        elif was_add:
+            self.mem_sub = "list"          # adding aborted — back to the list
+        else:
+            # edit aborted — back to viewing the memory if it's still there
+            self.mem_sub = "detail" if self._selected_memory() else "list"
+
+    def _render_memories(self, stdscr):
+        """Draw the full-screen memory editor overlay."""
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        cap = max(1, w - 1)
+        title = ("memories — ↑/↓ select · enter view · a add · e edit · "
+                 "d delete · p pin · esc close")
+        try:
+            stdscr.addstr(0, 0, clip_to_width(title, cap),
+                          curses.color_pair(4) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        list_top = 2
+        list_h = max(1, h - list_top - 2)  # leave the bottom 2 rows for the footer
+        if not self.mem_items:
+            try:
+                stdscr.addstr(list_top, 0,
+                              "(no memories yet — press 'a' to add one)",
+                              curses.A_DIM)
+            except curses.error:
+                pass
+        else:
+            # Scroll the window so the selected row stays visible.
+            top = 0
+            if self.mem_sel >= list_h:
+                top = self.mem_sel - list_h + 1
+            for row in range(list_h):
+                idx = top + row
+                if idx >= len(self.mem_items):
+                    break
+                m = self.mem_items[idx]
+                pin = "★" if m.get("pinned") else " "
+                conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+                cat = m.get("category")
+                tag = f"[{cat}] " if cat else ""
+                line = f"{pin} {conf:.2f} {tag}{m.get('text', '')}"
+                attr = curses.A_REVERSE if idx == self.mem_sel else curses.A_NORMAL
+                try:
+                    stdscr.addstr(list_top + row, 0, clip_to_width(line, cap), attr)
+                except curses.error:
+                    pass
+
+        # Footer: separator + a context line for the current sub-mode.
+        sep = "─" * cap
+        try:
+            stdscr.addstr(h - 2, 0, sep, curses.A_DIM)
+        except curses.error:
+            pass
+        if self.mem_sub == "confirm":
+            sel = self._selected_memory()
+            preview = (sel.get("text", "") if sel else "")[:60]
+            footer = f"delete \"{preview}\"? (y/n)"
+        else:
+            footer = f"{len(self.mem_items)} memories"
+        try:
+            stdscr.addstr(h - 1, 0, clip_to_width(footer, cap), curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def _render_memory_detail(self, stdscr):
+        """Draw the centered popup showing the selected memory in full.
+
+        Every stored column is listed and the text is wrapped to the box width,
+        so a long memory is fully readable. When the content is taller than the
+        box, a scrollbar on the right edge tracks mem_detail_scroll.
+        """
+        m = self._selected_memory()
+        if m is None:
+            self.mem_sub = "list"
+            return
+        h, w = stdscr.getmaxyx()
+        box_w = max(24, min(w - 4, 76))
+        inner_w = box_w - 4          # 1 border + 1 pad on each side
+        left = max(0, (w - box_w) // 2)
+
+        # Build the content lines: one per data column, then the wrapped text.
+        conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+        content = [
+            f"ID:         {m.get('id', '—')}",
+            f"Category:   {m.get('category') or '—'}",
+            f"Confidence: {conf:.2f}",
+            f"Pinned:     {'yes' if m.get('pinned') else 'no'}",
+            f"First seen: {m.get('first_seen') or '—'}",
+            f"Updated:    {m.get('ts') or '—'}",
+            "",
+            "Text:",
+        ]
+        for ln in textwrap.wrap(m.get("text", ""), inner_w) or [""]:
+            content.append("  " + ln)
+
+        inner_h = max(1, min(len(content), h - 6))
+        box_h = inner_h + 2
+        top = max(0, (h - box_h) // 2)
+        total = len(content)
+        max_scroll = max(0, total - inner_h)
+        self.mem_detail_scroll = max(0, min(self.mem_detail_scroll, max_scroll))
+        scroll = self.mem_detail_scroll
+
+        # Scrollbar thumb geometry (only when the content overflows the box).
+        thumb_lo = thumb_hi = -1
+        if max_scroll > 0:
+            thumb = max(1, inner_h * inner_h // total)
+            pos = (scroll * (inner_h - thumb)) // max_scroll
+            thumb_lo, thumb_hi = pos, pos + thumb
+
+        def put(row, col, s, attr=curses.A_NORMAL):
+            try:
+                stdscr.addstr(row, col, s, attr)
+            except curses.error:
+                pass
+
+        bar = curses.color_pair(4) | curses.A_BOLD
+        title = " memory "
+        head = "┌" + title + "─" * max(0, box_w - 2 - len(title)) + "┐"
+        put(top, left, clip_to_width(head, box_w), bar)
+        for i in range(inner_h):
+            idx = scroll + i
+            text = content[idx] if idx < total else ""
+            right = "│"
+            if max_scroll > 0:
+                right = "█" if thumb_lo <= i < thumb_hi else "│"
+            put(top + 1 + i, left, "│ ", bar)
+            put(top + 1 + i, left + 2, clip_to_width(text, inner_w))
+            put(top + 1 + i, left + box_w - 2, " " + right, bar)
+        hint = " ↑/↓ scroll · e edit · d delete · p pin · esc back "
+        foot = "└" + hint + "─" * max(0, box_w - 2 - len(hint)) + "┘"
+        put(top + box_h - 1, left, clip_to_width(foot, box_w), bar)
+
+    def _render_memory_edit(self, stdscr):
+        """Draw the in-popup editor for adding or editing a memory's text.
+
+        The text wraps within the box and the hardware cursor follows mem_cursor;
+        the box scrolls so the caret's row stays in view wherever it moves. For an
+        edit, the memory's read-only columns are shown above the text.
+        """
+        h, w = stdscr.getmaxyx()
+        box_w = max(24, min(w - 4, 76))
+        inner_w = max(1, box_w - 4)
+        left = max(0, (w - box_w) // 2)
+        adding = self.mem_sub == "add"
+        sel = None if adding else self._selected_memory()
+        if not adding and sel is None:
+            self.mem_sub = "list"
+            return
+        # Record the wrap width so caret up/down moves re-wrap consistently.
+        self.mem_edit_width = inner_w
+
+        # Read-only header columns for an edit (none when adding a fresh memory).
+        header = []
+        if sel is not None:
+            conf = _clamp_confidence(sel.get("confidence"), _DEFAULT_CONFIDENCE)
+            header = [
+                f"Category:   {sel.get('category') or '—'}",
+                f"Confidence: {conf:.2f}",
+                f"Pinned:     {'yes' if sel.get('pinned') else 'no'}",
+                "",
+            ]
+        rows, pos = self._layout_text(self.mem_buf, inner_w)
+        content = header + rows
+        total = len(content)
+        inner_h = max(1, min(total, h - 6))
+        box_h = inner_h + 2
+        top = max(0, (h - box_h) // 2)
+
+        # Caret position, and scroll so its row stays visible as it moves.
+        caret = max(0, min(self.mem_cursor, len(self.mem_buf)))
+        cur_row, cur_col = pos[caret]
+        cur_abs_row = len(header) + cur_row
+        if cur_abs_row < inner_h:
+            scroll = 0
+        else:
+            scroll = min(max(0, total - inner_h), cur_abs_row - inner_h + 1)
+
+        def put(row, col, s, attr=curses.A_NORMAL):
+            try:
+                stdscr.addstr(row, col, s, attr)
+            except curses.error:
+                pass
+
+        bar = curses.color_pair(4) | curses.A_BOLD
+        title = " new memory " if adding else " edit memory "
+        head = "┌" + title + "─" * max(0, box_w - 2 - len(title)) + "┐"
+        put(top, left, clip_to_width(head, box_w), bar)
+        for i in range(inner_h):
+            idx = scroll + i
+            line = content[idx] if idx < total else ""
+            attr = curses.A_DIM if idx < len(header) else curses.A_NORMAL
+            put(top + 1 + i, left, "│ ", bar)
+            put(top + 1 + i, left + 2, clip_to_width(line, inner_w), attr)
+            put(top + 1 + i, left + box_w - 2, " │", bar)
+        hint = " ←/→ move · enter save · esc cancel "
+        foot = "└" + hint + "─" * max(0, box_w - 2 - len(hint)) + "┘"
+        put(top + box_h - 1, left, clip_to_width(foot, box_w), bar)
+
+        # Park the hardware cursor at the caret, inside the box.
+        cur_screen_row = top + 1 + (cur_abs_row - scroll)
+        cur_screen_col = left + 2 + min(cur_col, inner_w - 1)
+        try:
+            stdscr.move(cur_screen_row, cur_screen_col)
+        except curses.error:
+            pass
+
     # --- curses UI ---------------------------------------------------------
     def render(self, stdscr, buf):
+        if self.mem_active:
+            self._render_memories(stdscr)
+            if self.mem_sub == "detail":
+                self._render_memory_detail(stdscr)
+            elif self.mem_sub in ("edit", "add"):
+                self._render_memory_edit(stdscr)
+            stdscr.refresh()
+            return
         h, w = stdscr.getmaxyx()
         out_h = h - 2  # leave bottom 2 rows for separator + input
 
@@ -617,11 +1229,17 @@ class Audience:
             "hint": curses.color_pair(4),
             "normal": curses.A_NORMAL,
         }
+        throb_entry = self.throb_entry
         wrapped = []  # (attr, text)
-        for idx, (style, text, _transient) in enumerate(entries):
+        for idx, entry in enumerate(entries):
+            style, text = entry[0], entry[1]
             if idx:  # blank spacer line between entries
                 wrapped.append((curses.A_NORMAL, ""))
             attr = styles.get(style, curses.A_NORMAL)
+            # a reply that's been opened but hasn't streamed yet gets an animated
+            # throbber so the operator can see the model is working.
+            if entry is throb_entry:
+                text = text + self._throbber()
             for line in textwrap.wrap(text, max(1, text_cap)) or [""]:
                 wrapped.append((attr, line))
 
@@ -706,7 +1324,8 @@ class Audience:
 
     def _loop(self, stdscr):
         self.emit("audience ready. First screenshot in 5s. "
-                  "Type a question, or /screenshot, /dream, /quit.", style="hint")
+                  "Type a question, or /screenshot, /dream, /memories, /quit.",
+                  style="hint")
         if self.shiny:
             self.emit("✦ a shiny gold dragon is watching ✦", style="hint")
 
@@ -717,11 +1336,22 @@ class Audience:
 
         buf = ""
         esc = 0  # escape-sequence state: 0=none, 1=saw ESC, 2=saw ESC[
+        esc_at = 0.0  # monotonic time we entered esc==1, to flush a lone ESC
         while not self.stop.is_set():
             self.render(stdscr, buf)
             try:
                 ch = stdscr.get_wch()
             except curses.error:
+                # No byte ready. A lone ESC is indistinguishable from the start
+                # of a focus sequence (ESC [ I/O) until the next byte arrives —
+                # but the rest of a real sequence is already buffered and comes
+                # back immediately. So if we've held ESC across an idle poll, it
+                # was a real, standalone ESC: deliver it now instead of waiting
+                # for the user's next keystroke.
+                if esc == 1 and time.monotonic() - esc_at > 0.04:
+                    esc = 0
+                    if self.mem_active:
+                        self._memories_key("\x1b")
                 time.sleep(0.05)
                 continue
             if isinstance(ch, str):
@@ -729,10 +1359,23 @@ class Audience:
                 # Intercept them before they reach the prompt buffer.
                 if esc == 0 and ch == "\x1b":
                     esc = 1
+                    esc_at = time.monotonic()
                     continue
                 if esc == 1:
-                    esc = 2 if ch == "[" else 0
-                    continue
+                    if ch == "[":
+                        esc = 2
+                        continue
+                    esc = 0
+                    # A lone ESC (not the start of a focus sequence). Deliver it
+                    # to the editor as a cancel/close, then handle the char that
+                    # followed — unless that char is itself ESC, in which case
+                    # restart the machine so the second ESC is tracked on its own.
+                    if self.mem_active:
+                        self._memories_key("\x1b")
+                    if ch == "\x1b":
+                        esc = 1
+                        esc_at = time.monotonic()
+                        continue
                 if esc == 2:
                     esc = 0
                     if ch == "I":
@@ -742,6 +1385,9 @@ class Audience:
                         self.platform.note_focus(False)
                         continue
                     # not a focus event — fall through and treat as normal input
+                if self.mem_active:
+                    self._memories_key(ch)
+                    continue
                 if ch in ("\n", "\r"):
                     self.handle_submit(buf)
                     buf = ""
@@ -754,6 +1400,9 @@ class Audience:
                 elif ch.isprintable():
                     buf += ch
             else:
+                if self.mem_active:
+                    self._memories_key(ch)
+                    continue
                 if ch == curses.KEY_BACKSPACE:
                     buf = buf[:-1]
                 elif ch == curses.KEY_PPAGE:

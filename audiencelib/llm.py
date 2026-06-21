@@ -11,11 +11,80 @@ from .tools import run_tool, SIDE_EFFECTING_TOOLS
 # --------------------------------------------------------------------------
 # Model call
 # --------------------------------------------------------------------------
+def _read_stream(resp, on_delta):
+    """Consume a streamed (SSE) chat completion into a single assistant message.
+
+    llama.cpp emits `data: {...}` lines, one JSON chunk each, terminated by
+    `data: [DONE]`. We accumulate the answer text (calling on_delta with each
+    new piece for live display), any reasoning_content, and — since tool calls
+    also arrive fragmented — reassemble tool_calls from their per-index deltas
+    (partial id / function.name / function.arguments). Returns
+    (message_dict, finish_reason) shaped like the non-streamed message.
+    """
+    content_parts, reasoning_parts = [], []
+    tool_calls = {}   # index -> {id, type, function: {name, arguments}}
+    finish_reason = None
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except ValueError:
+            continue
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+        delta = choice.get("delta") or {}
+        piece = delta.get("content")
+        if piece:
+            content_parts.append(piece)
+            if on_delta is not None:
+                on_delta(piece)
+        rpiece = delta.get("reasoning_content")
+        if rpiece:
+            reasoning_parts.append(rpiece)
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            slot = tool_calls.setdefault(
+                idx, {"id": None, "type": "function",
+                      "function": {"name": "", "arguments": ""}})
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+
+    msg = {"content": "".join(content_parts),
+           "reasoning_content": "".join(reasoning_parts)}
+    if tool_calls:
+        calls = []
+        for idx in sorted(tool_calls):
+            call = tool_calls[idx]
+            if not call["id"]:
+                call["id"] = f"call_{idx}"  # some servers omit ids when streaming
+            calls.append(call)
+        msg["tool_calls"] = calls
+    return msg, finish_reason
+
+
 def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
-              source=None):
+              source=None, on_delta=None):
     # image_bytes is optional: typed questions are sent as plain text, while
     # the periodic commentary attaches a fresh screenshot. `source` is the call
     # provenance, threaded to run_tool so the remember tool clamps confidence.
+    # on_delta, when given, is called with each chunk of answer text as it
+    # streams, so callers can paint the reply live instead of after the last
+    # token. It is only invoked on the final answer turn, never for tool-call
+    # turns (which carry no content).
     if image_bytes is not None:
         b64 = base64.b64encode(image_bytes).decode()
         content = [
@@ -48,7 +117,9 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": max_tokens,
-            "stream": False,
+            # Stream tokens so callers can paint the reply as it's produced; the
+            # total generation time is unchanged, only when text appears.
+            "stream": True,
             # Skip the reasoning phase: ~10x faster and content lands directly
             # in the message instead of reasoning_content. Honored by the
             # server's jinja chat template.
@@ -63,9 +134,7 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
             url, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read())
-        choice = data["choices"][0]
-        msg = choice["message"]
+            msg, finish_reason = _read_stream(resp, on_delta)
 
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
@@ -102,7 +171,7 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
         # off mid-thought, surface what we have rather than a blank line.
         reasoning = (msg.get("reasoning_content") or "").strip()
         if reasoning:
-            if choice.get("finish_reason") == "length":
+            if finish_reason == "length":
                 return "(model ran out of tokens while thinking) " + reasoning
             return reasoning
         return "(model returned no content)"

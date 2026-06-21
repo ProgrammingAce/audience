@@ -68,6 +68,73 @@ _MIN_PROMPT_CONFIDENCE = 0.3  # below this, a fact is omitted from the prompt en
 _DREAM_EVERY = 10
 _SHORT_TERM_AFTER_DREAM = 5
 
+# "Reflect": a synthesis pass run right after a successful dream. It derives a few
+# higher-level insights from the consolidated facts (e.g. "the operator is a Python
+# developer" from several Python-project facts). It only fires once there are at
+# least _REFLECT_MIN_FACTS facts to reason over, and adds at most
+# _MAX_INSIGHTS_PER_REFLECT new insight entries. Insights are the dragon's own
+# fallible deductions (source="reflected"), so their confidence is capped like an
+# inferred fact and a later dream is free to prune the weak ones.
+_REFLECT_MIN_FACTS = 5
+_MAX_INSIGHTS_PER_REFLECT = 3
+_INSIGHT_CATEGORY = "insight"
+
+# Pinned ("absolute") facts — the operator's name, the dragon's own name, anything
+# the operator explicitly pins — are never decayed, dropped, or rewritten by a
+# dream, and are always surfaced in the prompt regardless of the budget below. A
+# stated identity fact is pinned automatically; /pin and /unpin toggle it by hand.
+_PIN_CATEGORY = "identity"
+
+# Subject — WHOSE fact this is. The dragon learns facts about two distinct people:
+# the operator it watches ("operator") and, occasionally, ITSELF ("self") — its
+# own name, its own traits. Storing both in one undifferentiated pool is what made
+# the dragon answer "what is your name?" with the operator's name: it had no way to
+# tell an operator-fact from a self-fact. Every memory now carries a subject, the
+# prompt presents the two pools under separate headers, and a fact's id folds the
+# subject in so "named Ace" about the operator and "named Ace" about the dragon are
+# distinct entries that never collide or dedupe into one. Legacy entries written
+# before subjects existed default to the operator on read.
+_SUBJECT_OPERATOR = "operator"
+_SUBJECT_SELF = "self"
+_DEFAULT_SUBJECT = _SUBJECT_OPERATOR
+# Aliases a small local model might reach for when it means "about me, the dragon".
+_SELF_ALIASES = frozenset({"self", "dragon", "me", "myself", "you", "yourself"})
+
+
+def _normalize_subject(subject):
+    """Coerce a model-supplied subject to 'self' or 'operator' (the default)."""
+    s = (subject or "").strip().lower()
+    return _SUBJECT_SELF if s in _SELF_ALIASES else _SUBJECT_OPERATOR
+
+
+def _mem_id(text, subject=_DEFAULT_SUBJECT):
+    """Content-hash id for a fact, namespaced by subject.
+
+    An operator fact hashes its bare text, so ids minted before subjects existed
+    stay stable; a self fact hashes a subject-tagged key, so the same words about
+    the dragon get a distinct id and never collapse into the operator's copy.
+    """
+    subject = _normalize_subject(subject)
+    key = text if subject == _SUBJECT_OPERATOR else f"[{subject}] {text}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+
+# Recall / prompt ranking. A memory's score blends lexical relevance to the query,
+# its confidence, and its recency; a pinned fact gets a large constant boost so it
+# always sorts first. _MEMORY_PROMPT_BUDGET caps how many characters of long-term
+# memory get inlined into the system prompt (the store can hold _MAX_MEMORIES, far
+# more than a small local model wants in context), pinned facts aside.
+_RELEVANCE_WEIGHT = 1.0
+_CONFIDENCE_WEIGHT = 0.5
+_RECENCY_WEIGHT = 0.3
+_RECENCY_HALFLIFE_DAYS = 30.0   # a fact's recency score halves every ~month
+_PIN_SCORE_BOOST = 1000.0       # dwarfs every other term so pinned sorts first
+_MEMORY_PROMPT_BUDGET = 4000    # chars of long-term memory inlined into the prompt
+
+# Tiny stopword set so lexical relevance keys on content words, not glue.
+_STOPWORDS = frozenset(
+    "a an and are as at be by for from has have in is it its of on or that the "
+    "their them they this to was were will with you your".split())
+
 # Gold hoard: a reward/punishment ledger the operator drives ("take 10 gold",
 # "I'm subtracting 100 gold"). The arithmetic lives in code, never the model: the
 # tool reads the stored int, applies the operator's signed amount, and writes it
@@ -182,9 +249,16 @@ def read_long_term():
     for path in _shard_glob("long_term"):
         for m in _read_jsonl(path):
             mid = m.get("id")
-            if not mid or mid in suppressed or mid in by_id:
+            if not mid or mid in suppressed:
                 continue
-            by_id[mid] = m
+            if mid in by_id:
+                # Same fact on another machine: keep the first copy, but let a pin
+                # on any shard win so a /pin written as a local shadow reliably
+                # sticks regardless of which shard read first.
+                if m.get("pinned"):
+                    by_id[mid]["pinned"] = True
+                continue
+            by_id[mid] = dict(m)
     return sorted(by_id.values(), key=lambda m: m.get("ts") or "")
 
 
@@ -250,65 +324,154 @@ def _resolve_confidence(confidence, source):
         ceiling = 0.7
         c = _clamp_confidence(confidence, 0.5)
         return min(ceiling, c)
+    if source == "reflected":
+        # A synthesized insight is the dragon's own deduction, not something the
+        # operator stated — hedge it like an inferred fact so it reads as tentative.
+        ceiling = 0.7
+        c = _clamp_confidence(confidence, 0.6)
+        return min(ceiling, c)
     # Unknown provenance: trust the claim but default to the neutral baseline.
     return _clamp_confidence(confidence, _DEFAULT_CONFIDENCE)
 
 
-def tool_remember(text="", category=None, confidence=None, source=None, **_):
+def tool_remember(text="", category=None, confidence=None, source=None,
+                  subject=None, **_):
     """Append a durable fact to long-term memory.
 
     Refuses empties and duplicates, trims to _MAX_MEMORY_TEXT, and enforces the
-    _MAX_MEMORIES cap so an injected model can't flood the store. The id is a
-    short hash of the text, used later by forget. Confidence is clamped by the
-    call's `source` (see _resolve_confidence), which the dispatcher injects — it
-    is not model-controlled.
+    _MAX_MEMORIES cap so an injected model can't flood the store. `subject` records
+    WHOSE fact this is — the operator (default) or the dragon itself ("self") — so
+    a fact about the dragon's own name is never confused with the operator's. The
+    id folds the subject in, so the same text about each is two distinct entries.
+    Confidence is clamped by the call's `source` (see _resolve_confidence), which
+    the dispatcher injects — it is not model-controlled.
     """
     text = (text or "").strip()
     if not text:
         return {"success": False, "error": "nothing to remember (empty text)"}
     if len(text) > _MAX_MEMORY_TEXT:
         text = text[:_MAX_MEMORY_TEXT]
+    subject = _normalize_subject(subject)
     conf = _resolve_confidence(confidence, source)
     try:
         memories = read_long_term()  # union across machines, minus tombstones
-        if any(m.get("text") == text for m in memories):
+        if any(m.get("text") == text
+               and _normalize_subject(m.get("subject")) == subject
+               for m in memories):
             return {"success": False, "error": "already remembered"}
         if len(memories) >= _MAX_MEMORIES:
             return {"success": False,
                     "error": "memory is full; forget something first"}
-        mem_id = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+        mem_id = _mem_id(text, subject)
         # If this fact was previously forgotten, lift its tombstone instead of
         # leaving the re-remember masked by the old suppression.
         _remove_tombstones({mem_id})
-        _append_jsonl(_long_term_path(), {  # this machine's own shard
+        now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        # A fact the operator states about who's who — their name, the dragon's
+        # name — is an absolute: pin it so no dream can ever age it out.
+        pinned = (source == "stated" and category == _PIN_CATEGORY)
+        entry = {  # this machine's own shard
             "id": mem_id,
-            "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "ts": now,
+            "first_seen": now,
             "category": (category or None),
+            "subject": subject,
             "text": text,
             "confidence": round(conf, 2),
-        })
-        return {"success": True, "id": mem_id, "confidence": round(conf, 2)}
+        }
+        if pinned:
+            entry["pinned"] = True
+        _append_jsonl(_long_term_path(), entry)
+        return {"success": True, "id": mem_id, "confidence": round(conf, 2),
+                "pinned": pinned, "subject": subject}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def tool_recall(query="", **_):
-    """Return long-term memories whose text or category matches query (substring)."""
+def _tokenize(text):
+    """Lowercase content-word tokens of `text`, dropping stopwords and glue."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
+
+
+def _age_days(entry, now):
+    """Whole days since the fact was first learned (or last stamped). 0 on error."""
+    stamp = entry.get("first_seen") or entry.get("ts")
+    if not stamp:
+        return 0.0
+    try:
+        when = dt.datetime.fromisoformat(stamp)
+    except (ValueError, TypeError):
+        return 0.0
+    if when.tzinfo is None:
+        when = when.astimezone()
+    return max(0.0, (now - when).total_seconds() / 86400.0)
+
+
+def _score_memory(entry, query_tokens, now):
+    """Rank a memory for retrieval: relevance + confidence + recency, pinned first.
+
+    `query_tokens` is the tokenized query (empty set ⇒ no relevance term, so the
+    ranking falls back to confidence and recency — used by the query-less prompt
+    path). Recency decays on a half-life so an old fact fades but never goes
+    negative; a pinned absolute gets a boost that dwarfs every other term.
+    """
+    score = 0.0
+    if query_tokens:
+        fact_tokens = _tokenize(
+            (entry.get("text") or "") + " " + (entry.get("category") or ""))
+        if fact_tokens:
+            overlap = len(query_tokens & fact_tokens) / len(query_tokens)
+            score += _RELEVANCE_WEIGHT * overlap
+    score += _CONFIDENCE_WEIGHT * _clamp_confidence(entry.get("confidence"),
+                                                    _DEFAULT_CONFIDENCE)
+    recency = 0.5 ** (_age_days(entry, now) / _RECENCY_HALFLIFE_DAYS)
+    score += _RECENCY_WEIGHT * recency
+    if entry.get("pinned"):
+        score += _PIN_SCORE_BOOST
+    return score
+
+
+def rank_memories(memories, query="", limit=None):
+    """Memories sorted best-first by _score_memory; optionally capped to `limit`."""
+    now = dt.datetime.now().astimezone()
+    query_tokens = _tokenize(query)
+    ranked = sorted(memories,
+                    key=lambda m: _score_memory(m, query_tokens, now),
+                    reverse=True)
+    return ranked[:limit] if limit is not None else ranked
+
+
+def tool_recall(query="", subject=None, **_):
+    """Return long-term memories matching `query`, best-first by relevance.
+
+    Matches on a substring of the text/category as before, then ranks the hits by
+    _score_memory (relevance + confidence + recency, pinned first) rather than the
+    order they happen to sit in the file. An empty query returns the whole store
+    ranked by confidence and recency. Pass `subject` ('operator' or 'self') to
+    limit the search to facts about that one — e.g. recall your own name with
+    subject='self' rather than fishing the operator's name out by mistake.
+    """
     query = (query or "").strip().lower()
+    want_subject = _normalize_subject(subject) if subject else None
     try:
         memories = read_long_term()
     except Exception as e:
         return {"success": False, "error": str(e)}
+    if want_subject is not None:
+        memories = [m for m in memories
+                    if _normalize_subject(m.get("subject")) == want_subject]
     if not query:
         matches = memories
     else:
         matches = [m for m in memories
                    if query in (m.get("text") or "").lower()
                    or query in (m.get("category") or "").lower()]
-    matches = matches[:_RECALL_LIMIT]
+    matches = rank_memories(matches, query=query, limit=_RECALL_LIMIT)
     return {
         "success": True,
         "matches": [{"id": m.get("id"), "category": m.get("category"),
+                     "subject": _normalize_subject(m.get("subject")),
                      "text": m.get("text"),
                      "confidence": _clamp_confidence(m.get("confidence"),
                                                      _DEFAULT_CONFIDENCE)}
@@ -331,6 +494,85 @@ def tool_forget(id="", **_):
             return {"success": False, "error": "no memory with that id"}
         _add_tombstones({mem_id})
         return {"success": True, "id": mem_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def set_pinned(mem_id, pinned):
+    """Pin or unpin a long-term fact by id; pin state lives in this machine's shard.
+
+    A pinned ("absolute") fact — the operator's name, the dragon's name — is never
+    decayed or dropped by a dream and always makes it into the prompt. If the fact
+    sits only in a peer's shard (which we must not rewrite), pinning writes a pinned
+    shadow copy to this machine's shard; read_long_term ORs the pin across shards.
+    """
+    mem_id = (mem_id or "").strip()
+    if not mem_id:
+        return {"success": False, "error": "no id given"}
+    target = next((m for m in read_long_term() if m.get("id") == mem_id), None)
+    if target is None:
+        return {"success": False, "error": "no memory with that id"}
+    local = _read_jsonl(_long_term_path())
+    found = False
+    for e in local:
+        if e.get("id") == mem_id:
+            found = True
+            if pinned:
+                e["pinned"] = True
+            else:
+                e.pop("pinned", None)
+    if found:
+        _rewrite_jsonl(_long_term_path(), local)
+    elif pinned:
+        # Fact lives only in a peer shard: write a pinned shadow locally so the
+        # union sees it pinned without our touching the peer's file.
+        shadow = dict(target)
+        shadow["pinned"] = True
+        _append_jsonl(_long_term_path(), shadow)
+    return {"success": True, "id": mem_id, "pinned": bool(pinned)}
+
+
+def edit_memory(mem_id, new_text):
+    """Replace a long-term fact's text, preserving its category/confidence/pin.
+
+    The id is a content hash, so editing the text mints a new id: we write a fresh
+    entry (carrying the original metadata) to this machine's shard and tombstone the
+    old id so the prior text is suppressed across every shard — the same edit-as-
+    replace dance set_pinned/forget use for the sharded store. A no-op edit (text
+    unchanged) succeeds without touching disk; editing onto text that already exists
+    as another live memory is refused so two ids never share content.
+    """
+    mem_id = (mem_id or "").strip()
+    new_text = (new_text or "").strip()
+    if not mem_id:
+        return {"success": False, "error": "no id given"}
+    if not new_text:
+        return {"success": False, "error": "nothing to save (empty text)"}
+    if len(new_text) > _MAX_MEMORY_TEXT:
+        new_text = new_text[:_MAX_MEMORY_TEXT]
+    try:
+        memories = read_long_term()
+        target = next((m for m in memories if m.get("id") == mem_id), None)
+        if target is None:
+            return {"success": False, "error": "no memory with that id"}
+        # The edited fact stays about whoever the original was about, so its new
+        # id is namespaced by the same subject the dedup/lookup keys on.
+        subject = _normalize_subject(target.get("subject"))
+        new_id = _mem_id(new_text, subject)
+        if new_id == mem_id:
+            return {"success": True, "id": mem_id}  # unchanged; nothing to do
+        if any(m.get("id") == new_id for m in memories):
+            return {"success": False, "error": "already remembered"}
+        now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        entry = dict(target)
+        entry["id"] = new_id
+        entry["text"] = new_text
+        entry["ts"] = now
+        entry["first_seen"] = target.get("first_seen") or target.get("ts") or now
+        _remove_tombstones({new_id})
+        _append_jsonl(_long_term_path(), entry)
+        _add_tombstones({mem_id})
+        return {"success": True, "id": new_id, "previous_id": mem_id}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -455,6 +697,14 @@ def apply_dream(raw):
     if mems is None:
         return False, "unparseable dream"
 
+    previous = read_long_term()  # union of every machine's live memories
+    prev_by_id = {m.get("id"): m for m in previous if m.get("id")}
+    # Fallback for recovering a dropped subject: map a fact's exact text back to the
+    # subject it was filed under before the dream.
+    prev_subject_by_text = {m.get("text"): _normalize_subject(m.get("subject"))
+                            for m in previous}
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
     refined = []
     seen = set()
     for m in mems:
@@ -465,23 +715,58 @@ def apply_dream(raw):
             continue
         if len(text) > _MAX_MEMORY_TEXT:
             text = text[:_MAX_MEMORY_TEXT]
-        if text in seen:
+        # A fact keeps WHOSE it is across the dream: the model is told to echo the
+        # subject. If it dropped it, recover the subject from a prior fact with the
+        # same text, so a self fact carried through verbatim isn't re-filed under the
+        # operator. Distinct subjects make distinct ids — a self fact never merges
+        # into the operator's pool.
+        if m.get("subject") is not None:
+            subject = _normalize_subject(m.get("subject"))
+        else:
+            subject = prev_subject_by_text.get(text, _DEFAULT_SUBJECT)
+        if (text, subject) in seen:
             continue  # collapse any duplicates the dream left behind
-        seen.add(text)
-        cat = m.get("category")
-        refined.append({
-            "id": hashlib.sha1(text.encode("utf-8")).hexdigest()[:8],
-            "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-            "category": (cat or None),
+        seen.add((text, subject))
+        mem_id = _mem_id(text, subject)
+        prior = prev_by_id.get(mem_id)
+        # A fact carried through the dream unchanged (same content hash) keeps its
+        # original age — only genuinely new or merged text gets a fresh stamp, so
+        # consolidation no longer resets the clock the staleness check reads.
+        ts = (prior or {}).get("ts") or now
+        first_seen = (prior or {}).get("first_seen") or ts
+        entry = {
+            "id": mem_id,
+            "ts": ts,
+            "first_seen": first_seen,
+            "category": (m.get("category") or None),
+            "subject": subject,
             "text": text,
             "confidence": round(_clamp_confidence(m.get("confidence"),
                                                   _DEFAULT_CONFIDENCE), 2),
-        })
+        }
+        # A pin survives the dream no matter what the model said: if it was pinned
+        # before, it stays pinned (and keeps its full prior confidence).
+        if prior and prior.get("pinned"):
+            entry["pinned"] = True
+            entry["confidence"] = round(_clamp_confidence(
+                prior.get("confidence"), _DEFAULT_CONFIDENCE), 2)
+        refined.append(entry)
         if len(refined) >= _MAX_MEMORIES:
             break
 
+    # Safety net for absolutes: re-inject any pinned fact the dream dropped (the
+    # model may ignore the instruction). Prepend so a full store can't crowd them
+    # out, then re-cap. After this, no pinned id can be lost or tombstoned. Keyed by
+    # id (subject-aware), so a pinned self fact survives even if an operator fact
+    # happens to share its text.
+    refined_ids_so_far = {e["id"] for e in refined}
+    dropped_pins = [m for m in previous
+                    if m.get("pinned") and m.get("id") not in refined_ids_so_far]
+    if dropped_pins:
+        refined = dropped_pins + refined
+        refined = refined[:_MAX_MEMORIES]
+
     try:
-        previous = read_long_term()  # union of every machine's live memories
         refined_ids = {m["id"] for m in refined}
         # Back up the pre-dream store so a regrettable consolidation is
         # recoverable, in this machine's own backup shard.
@@ -505,3 +790,56 @@ def apply_dream(raw):
     except Exception as e:
         return False, str(e)
     return True, len(refined)
+
+
+def add_insights(insights):
+    """Persist a few synthesized insights as long-term facts; return the count added.
+
+    Each insight is the dragon's own deduction (category 'insight', confidence
+    capped like an inferred fact via the 'reflected' source). Deduped against the
+    live store by content hash so repeated reflection doesn't pile up, capped to
+    _MAX_INSIGHTS_PER_REFLECT per pass and to _MAX_MEMORIES overall. Insights are
+    never pinned, so a later dream is free to prune the weak ones.
+    """
+    if not insights:
+        return 0
+    try:
+        existing = read_long_term()
+    except Exception:
+        return 0
+    existing_ids = {m.get("id") for m in existing}
+    count = len(existing)
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    added = 0
+    for ins in insights:
+        if added >= _MAX_INSIGHTS_PER_REFLECT or count >= _MAX_MEMORIES:
+            break
+        if not isinstance(ins, dict):
+            continue
+        text = (ins.get("text") or "").strip()
+        if not text:
+            continue
+        if len(text) > _MAX_MEMORY_TEXT:
+            text = text[:_MAX_MEMORY_TEXT]
+        # Reflection generalizes about the operator, so insights are operator facts.
+        mem_id = _mem_id(text, _SUBJECT_OPERATOR)
+        if mem_id in existing_ids:
+            continue  # already known — don't re-add on the next reflection
+        conf = _resolve_confidence(ins.get("confidence"), "reflected")
+        try:
+            _remove_tombstones({mem_id})
+            _append_jsonl(_long_term_path(), {
+                "id": mem_id,
+                "ts": now,
+                "first_seen": now,
+                "category": _INSIGHT_CATEGORY,
+                "subject": _SUBJECT_OPERATOR,
+                "text": text,
+                "confidence": round(conf, 2),
+            })
+        except Exception:
+            continue
+        existing_ids.add(mem_id)
+        count += 1
+        added += 1
+    return added
