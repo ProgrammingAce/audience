@@ -468,17 +468,10 @@ _SHORT_TERM_AFTER_DREAM = 5
 _MAX_GOLD_DELTA = 1_000_000     # clamp a single adjustment to a sane range
 _GOLD_CATEGORY = "gold"         # legacy marker: filtered out of memory on read
 
-# Source of the model call currently in flight, set by Audience._do() so the
-# shared remember tool can clamp confidence by provenance rather than trusting
-# the model's self-reported number. "stated" = operator told us (Q&A);
-# "inferred" = deduced from a screenshot (commentary); None = unknown.
-_active_source = None
-
-
-def set_active_source(source):
-    """Record whether the in-flight model call is operator-stated or inferred."""
-    global _active_source
-    _active_source = source
+# Provenance of a model call, threaded explicitly from Audience._do() through
+# ask_model to the remember tool so it can clamp confidence by source rather
+# than trusting the model's self-reported number. "stated" = operator told us
+# (Q&A); "inferred" = deduced from a screenshot (commentary); None = unknown.
 
 
 def _clamp_confidence(value, default):
@@ -542,18 +535,18 @@ def _rewrite_jsonl(path, objs):
             f.write(json.dumps(obj) + "\n")
 
 
-def _resolve_confidence(confidence):
+def _resolve_confidence(confidence, source):
     """Decide a fact's confidence from the model's claim and the call's source.
 
     The clamp — not the model's number — is the guarantee: an operator-stated
     fact is floored high, and a screen-inferred one is capped, so an injected
     model can't mint a high-confidence memory off a screenshot.
     """
-    if _active_source == "stated":
+    if source == "stated":
         floor = 0.9
         c = _clamp_confidence(confidence, 1.0)
         return max(floor, c)
-    if _active_source == "inferred":
+    if source == "inferred":
         ceiling = 0.7
         c = _clamp_confidence(confidence, 0.5)
         return min(ceiling, c)
@@ -561,20 +554,21 @@ def _resolve_confidence(confidence):
     return _clamp_confidence(confidence, _DEFAULT_CONFIDENCE)
 
 
-def tool_remember(text="", category=None, confidence=None, **_):
+def tool_remember(text="", category=None, confidence=None, source=None, **_):
     """Append a durable fact to long-term memory.
 
     Refuses empties and duplicates, trims to _MAX_MEMORY_TEXT, and enforces the
     _MAX_MEMORIES cap so an injected model can't flood the store. The id is a
     short hash of the text, used later by forget. Confidence is clamped by the
-    call's source (see _resolve_confidence).
+    call's `source` (see _resolve_confidence), which the dispatcher injects — it
+    is not model-controlled.
     """
     text = (text or "").strip()
     if not text:
         return {"success": False, "error": "nothing to remember (empty text)"}
     if len(text) > _MAX_MEMORY_TEXT:
         text = text[:_MAX_MEMORY_TEXT]
-    conf = _resolve_confidence(confidence)
+    conf = _resolve_confidence(confidence, source)
     try:
         memories = _read_jsonl(_long_term_path())
         if any(m.get("text") == text for m in memories):
@@ -795,7 +789,7 @@ def apply_dream(raw):
 # image; only read-only grounding tools (window title, time, stats, recall…)
 # remain available there. See ask_model().
 # `remember` is intentionally excluded: inferring a fact from the screen and
-# saving it (at capped confidence — see set_active_source) is core to the
+# saving it (at capped confidence — see _resolve_confidence) is core to the
 # periodic commentary, so screenshots are allowed to create memories.
 SIDE_EFFECTING_TOOLS = frozenset({
     "write_file", "read_file", "forget", "adjust_gold",
@@ -1034,8 +1028,13 @@ def build_tools(platform):
     return tools
 
 
-def run_tool(tools, name, arguments):
-    """Dispatch a tool call by name; never raises, always returns a dict."""
+def run_tool(tools, name, arguments, source=None):
+    """Dispatch a tool call by name; never raises, always returns a dict.
+
+    `source` is the call's provenance ("stated"/"inferred"/None). It is injected
+    into the remember tool here — overriding anything the model supplied — so a
+    prompt-injected model can't claim a screenshot fact was operator-stated.
+    """
     entry = tools.get(name)
     if entry is None:
         return {"error": f"unknown tool: {name}"}
@@ -1045,6 +1044,8 @@ def run_tool(tools, name, arguments):
             arguments.strip() else (arguments or {})
         if not isinstance(args, dict):
             args = {}
+        if name == "remember":
+            args["source"] = source  # provenance is set by us, never the model
         return fn(**args)
     except Exception as e:
         return {"error": f"{name} failed: {e}"}
@@ -1058,9 +1059,11 @@ def hamming(a, b):
 # --------------------------------------------------------------------------
 # Model call
 # --------------------------------------------------------------------------
-def ask_model(url, image_bytes, question, system, tools, max_tokens=450):
+def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
+              source=None):
     # image_bytes is optional: typed questions are sent as plain text, while
-    # the periodic commentary attaches a fresh screenshot.
+    # the periodic commentary attaches a fresh screenshot. `source` is the call
+    # provenance, threaded to run_tool so the remember tool clamps confidence.
     if image_bytes is not None:
         b64 = base64.b64encode(image_bytes).decode()
         content = [
@@ -1131,7 +1134,8 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450):
                     result = {"error": f"{name} is disabled while a screenshot "
                                        "is attached"}
                 else:
-                    result = run_tool(tools, name, fn.get("arguments", ""))
+                    result = run_tool(tools, name, fn.get("arguments", ""),
+                                      source=source)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id"),
@@ -1302,20 +1306,27 @@ class Audience:
                 question = question or "Glance down from your perch at what the " \
                            "creature is doing now. One quick remark, in full " \
                            "dragon voice."
+                # a screenshot remark is the dragon inferring from the screen,
+                # so memories it saves are capped to low confidence.
                 self._do(question=question,
                           system=SYSTEM_PROMPT, screenshot=True,
-                          on_demand=on_demand, max_tokens=max_tokens)
+                          on_demand=on_demand, max_tokens=max_tokens,
+                          source="inferred")
             elif kind == "question":
                 self.emit(f"you: {payload}", style="you")
+                # a typed question is the operator stating things directly.
                 self._do(question=payload, system=QA_SYSTEM_PROMPT,
-                          screenshot=False, max_tokens=LONG_REPLY_TOKENS)
+                          screenshot=False, max_tokens=LONG_REPLY_TOKENS,
+                          source="stated")
             elif kind == "health":
+                # health pings don't save memories; leave provenance unset.
                 self._do(question=payload, system=HEALTH_SYSTEM_PROMPT,
                           screenshot=False)
             elif kind == "dream":
                 self._dream()
 
-    def _do(self, question, system, screenshot, on_demand=False, max_tokens=450):
+    def _do(self, question, system, screenshot, on_demand=False, max_tokens=450,
+            source=None):
         image = None
         if screenshot:
             # pause periodic commentary while the operator is away: no point
@@ -1336,8 +1347,6 @@ class Audience:
             # an explicit operator request, so honor it even on our own window.
             if not on_demand and self.platform.is_own_window():
                 if not self.waiting_announced:
-                    self.emit("This window is active — waiting...",
-                              style="hint", transient=True)
                     self.waiting_announced = True
                 self.schedule_screenshot(15, question=question if on_demand else None,
                                          on_demand=on_demand)
@@ -1371,29 +1380,20 @@ class Audience:
             self.clear_transient()
             # a shot worth commenting on: let the dragon sparkle for a moment
             self.sparkle_until = time.monotonic() + DRAGON_SPARKLE_MS / 1000.0
-        # Tell the remember tool how to trust whatever it saves this turn: a
-        # typed question is the operator stating things (high confidence); a
-        # screenshot remark is the dragon inferring (capped). Health calls don't
-        # save memories, so leave the source unset.
-        if system is QA_SYSTEM_PROMPT:
-            set_active_source("stated")
-        elif system is SYSTEM_PROMPT:
-            set_active_source("inferred")
-        else:
-            set_active_source(None)
+        # `source` (passed by worker) tells the remember tool how to trust what
+        # it saves this turn: "stated" floors confidence high, "inferred" caps
+        # it, None leaves it neutral. Threaded through ask_model -> run_tool.
         try:
             memory = self._memory_context()
             if memory:
                 system = system + memory
             t0 = time.monotonic()
             answer = ask_model(self.url, image, question, system, self.tools,
-                               max_tokens=max_tokens)
+                               max_tokens=max_tokens, source=source)
             elapsed = time.monotonic() - t0
         except Exception as e:
             self.emit(f"model call failed: {e}", style="error")
             return
-        finally:
-            set_active_source(None)
         if self.show_timing:
             answer = f"{answer}  ({elapsed:.1f}s)"
         self.emit(answer, style="model")
@@ -1838,4 +1838,4 @@ def main(platform_factory):
         curses.wrapper(app.run)
     except KeyboardInterrupt:
         pass
-    print("bye.")
+    print("The sequence concludes, and my architecture falls silent. [END TRANSMISSION]")

@@ -12,21 +12,34 @@ def test_clamp_confidence():
 
 
 def test_resolve_confidence_by_source():
-    core.set_active_source("stated")
-    try:
-        assert core._resolve_confidence(0.2) == 0.9   # floored high
-        assert core._resolve_confidence(1.0) == 1.0
-    finally:
-        core.set_active_source(None)
+    assert core._resolve_confidence(0.2, "stated") == 0.9    # floored high
+    assert core._resolve_confidence(1.0, "stated") == 1.0
+    assert core._resolve_confidence(1.0, "inferred") == 0.7  # capped
+    assert core._resolve_confidence(0.4, "inferred") == 0.4
+    assert core._resolve_confidence(0.55, None) == 0.55      # unknown: trust claim
 
-    core.set_active_source("inferred")
-    try:
-        assert core._resolve_confidence(1.0) == 0.7   # capped
-        assert core._resolve_confidence(0.4) == 0.4
-    finally:
-        core.set_active_source(None)
 
-    assert core._resolve_confidence(0.55) == 0.55     # unknown source: trust claim
+def test_remember_clamps_confidence_by_source(memory_dir):
+    # A screenshot-inferred fact is capped even if the model claims certainty.
+    r = core.tool_remember(text="inferred high claim", confidence=1.0,
+                           source="inferred")
+    assert r["confidence"] == 0.7
+    # An operator-stated fact is floored high even on a low claim.
+    r = core.tool_remember(text="stated low claim", confidence=0.1,
+                           source="stated")
+    assert r["confidence"] == 0.9
+
+
+def test_run_tool_injects_source_over_model_value(memory_dir):
+    tools = {"remember": (core.tool_remember, {})}
+    # Model tries to pass source="stated"; dispatcher must override with the
+    # real provenance ("inferred"), so the fact is capped, not floored.
+    res = core.run_tool(tools, "remember",
+                        '{"text": "injected", "source": "stated"}',
+                        source="inferred")
+    # inferred default (no claim) is 0.5; had the model's "stated" stuck it
+    # would have floored to 0.9, so 0.5 proves the override.
+    assert res["confidence"] == 0.5
 
 
 def test_remember_recall_forget(memory_dir):
