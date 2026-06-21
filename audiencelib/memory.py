@@ -204,7 +204,7 @@ def _read_jsonl(path):
     """Read a list of objects from a .jsonl file; skip corrupt/blank lines."""
     out = []
     try:
-        with open(path, "r") as f:
+        with open(path, "r", newline="") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -224,13 +224,13 @@ def _read_jsonl(path):
 
 def _append_jsonl(path, obj):
     _ensure_memory_dir()
-    with open(path, "a") as f:
+    with open(path, "a", newline="") as f:
         f.write(json.dumps(obj) + "\n")
 
 
 def _rewrite_jsonl(path, objs):
     _ensure_memory_dir()
-    with open(path, "w") as f:
+    with open(path, "w", newline="") as f:
         for obj in objs:
             f.write(json.dumps(obj) + "\n")
 
@@ -353,7 +353,7 @@ def _read_gold():
     """
     total = 0
     try:
-        with open(_legacy_gold_path(), "r") as f:
+        with open(_legacy_gold_path(), "r", newline="") as f:
             total += int(json.load(f).get("total", 0))
     except (FileNotFoundError, ValueError, TypeError, OSError):
         pass
