@@ -98,7 +98,7 @@ def _read_jsonl(path):
     """Read a list of objects from a .jsonl file; skip corrupt/blank lines."""
     out = []
     try:
-        with open(path, "r") as f:
+        with open(path, "r", newline="") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -118,13 +118,13 @@ def _read_jsonl(path):
 
 def _append_jsonl(path, obj):
     _ensure_memory_dir()
-    with open(path, "a") as f:
+    with open(path, "a", newline="") as f:
         f.write(json.dumps(obj) + "\n")
 
 
 def _rewrite_jsonl(path, objs):
     _ensure_memory_dir()
-    with open(path, "w") as f:
+    with open(path, "w", newline="") as f:
         for obj in objs:
             f.write(json.dumps(obj) + "\n")
 
@@ -231,7 +231,7 @@ def _gold_path():
 def _read_gold():
     """Current hoard total as an int; 0 if unset or corrupt."""
     try:
-        with open(_gold_path(), "r") as f:
+        with open(_gold_path(), "r", newline="") as f:
             data = json.load(f)
         return int(data.get("total", 0))
     except (FileNotFoundError, ValueError, TypeError, OSError):
@@ -240,7 +240,7 @@ def _read_gold():
 
 def _write_gold(total):
     _ensure_memory_dir()
-    with open(_gold_path(), "w") as f:
+    with open(_gold_path(), "w", newline="") as f:
         json.dump({"total": int(total),
                    "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds")},
                   f)
