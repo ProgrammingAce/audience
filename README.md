@@ -34,6 +34,25 @@ python3 audience.py
 python3 audience.py --interval 30 --url http://localhost:8080/v1/chat/completions
 ```
 
+## Sharing memory across machines
+
+Point `--memory-dir` at a synced folder (e.g. Dropbox) and run the app on each
+machine:
+
+```
+python3 audience.py --memory-dir ~/Dropbox/.audience_memory
+```
+
+Each install writes only to files suffixed with its own hostname
+(`long_term.<host>.jsonl`, `short_term.<host>.jsonl`, `gold.<host>.jsonl`,
+`tombstones.<host>.jsonl`), so two machines running at once never write the same
+file and the sync service never has to make a "conflicted copy". Reads union
+every machine's shard, keyed by each entry's content-hash id (so a fact written
+on both machines collapses to one). Forgetting and dream consolidation record
+tombstones rather than rewriting a peer's file, and gold is an append-only delta
+ledger summed across machines. The store is eventually-consistent: a peer's
+changes appear once the folder syncs them in.
+
 ## Development
 
 ```

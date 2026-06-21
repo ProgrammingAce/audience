@@ -3,9 +3,12 @@ dream consolidation pass. Pure stdlib; no curses or OS-specific code.
 """
 
 import datetime as dt
+import glob
 import hashlib
 import json
 import os
+import re
+import socket
 
 # Directory the script was launched from; the default memory dir sits beside it.
 _WORKDIR = os.getcwd()
@@ -25,8 +28,21 @@ _WORKDIR = os.getcwd()
 #
 # Like the file tools, the model is fully prompt-injectable, so memory is
 # confined to one dedicated directory: the tools never take a caller-supplied
-# path, only ever touching these two fixed files, and entries are capped in
+# path, only ever touching these fixed files, and entries are capped in
 # length and count so an injected model can't bloat the store or the context.
+#
+# Sharing across machines (e.g. a Dropbox-synced --memory-dir): each install
+# writes only to files suffixed with its own hostname — long_term.<host>.jsonl,
+# short_term.<host>.jsonl, tombstones.<host>.jsonl, gold.<host>.jsonl — so two
+# machines running at once never write the same file and Dropbox never has to
+# mint a "conflicted copy". Reads union every shard (this machine's plus every
+# peer's, plus any legacy un-suffixed file) keyed by entry id, which dedupes for
+# free since ids are content hashes. Removal can't rewrite a peer's file, so
+# forget and dream record tombstones (suppressed ids) rather than deleting:
+#   read set = union(all long_term shards) minus union(all tombstone shards).
+# Gold is an append-only per-machine delta ledger summed across shards, so two
+# concurrent adjustments both survive. The store is eventually-consistent: a
+# peer's writes appear once Dropbox syncs them in.
 # --------------------------------------------------------------------------
 
 # Default beside the working directory; overridable via --memory-dir so the same
@@ -82,12 +98,102 @@ def set_memory_dir(path):
     _MEMORY_DIR = os.path.realpath(os.path.expanduser(path))
 
 
+def _machine_id():
+    """A filesystem-safe, stable per-machine tag taken from the hostname.
+
+    Lowercased and reduced to [a-z0-9_-]; the first label of a dotted name is
+    enough (drop any domain suffix). Falls back to 'unknown' so a host with an
+    unusable name still gets a private, non-colliding shard.
+    """
+    try:
+        host = socket.gethostname()
+    except Exception:
+        host = ""
+    host = (host or "").split(".")[0].strip().lower()
+    host = re.sub(r"[^a-z0-9_-]", "-", host).strip("-")
+    return host or "unknown"
+
+
+# A shard filename is "<base>.<machine>.<ext>"; the backup adds a ".bak" infix.
+# Reads glob "<base>*.<ext>" so this machine's shard, every peer's shard, and any
+# legacy un-suffixed "<base>.<ext>" all come in together — minus backups.
+def _shard_path(base, ext="jsonl"):
+    """This machine's own shard to write to."""
+    return os.path.join(_MEMORY_DIR, f"{base}.{_machine_id()}.{ext}")
+
+
+def _shard_glob(base, ext="jsonl"):
+    """Every readable shard for `base`, excluding backup files."""
+    paths = glob.glob(os.path.join(_MEMORY_DIR, f"{base}*.{ext}"))
+    return sorted(p for p in paths if ".bak." not in os.path.basename(p))
+
+
 def _long_term_path():
-    return os.path.join(_MEMORY_DIR, "long_term.jsonl")
+    return _shard_path("long_term")
 
 
 def _short_term_path():
-    return os.path.join(_MEMORY_DIR, "short_term.jsonl")
+    return _shard_path("short_term")
+
+
+def _tombstone_path():
+    return _shard_path("tombstones")
+
+
+def _read_tombstones():
+    """Union of suppressed ids across every tombstone shard."""
+    suppressed = set()
+    for path in _shard_glob("tombstones"):
+        for obj in _read_jsonl(path):
+            tid = obj.get("id")
+            if tid:
+                suppressed.add(tid)
+    return suppressed
+
+
+def _add_tombstones(ids):
+    """Append suppressed ids to this machine's tombstone shard."""
+    ts = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    for tid in ids:
+        _append_jsonl(_tombstone_path(), {"id": tid, "ts": ts})
+
+
+def _remove_tombstones(ids):
+    """Lift suppression for `ids` from this machine's own tombstone shard.
+
+    Only this machine's shard can be rewritten safely; a tombstone a peer wrote
+    is lifted on that peer's side once its own re-remember syncs in.
+    """
+    path = _tombstone_path()
+    existing = _read_jsonl(path)
+    kept = [t for t in existing if t.get("id") not in ids]
+    if len(kept) != len(existing):
+        _rewrite_jsonl(path, kept)
+
+
+def read_long_term():
+    """All live long-term memories: union of every shard, minus tombstones.
+
+    Deduplicated by id (content hash), so the same fact written on two machines
+    collapses to one entry. Ordered oldest-first by timestamp for stability.
+    """
+    suppressed = _read_tombstones()
+    by_id = {}
+    for path in _shard_glob("long_term"):
+        for m in _read_jsonl(path):
+            mid = m.get("id")
+            if not mid or mid in suppressed or mid in by_id:
+                continue
+            by_id[mid] = m
+    return sorted(by_id.values(), key=lambda m: m.get("ts") or "")
+
+
+def read_short_term():
+    """Recent exchanges across every shard, ordered oldest-first by timestamp."""
+    entries = []
+    for path in _shard_glob("short_term"):
+        entries.extend(_read_jsonl(path))
+    return sorted(entries, key=lambda e: e.get("ts") or "")
 
 
 def _ensure_memory_dir():
@@ -164,14 +270,17 @@ def tool_remember(text="", category=None, confidence=None, source=None, **_):
         text = text[:_MAX_MEMORY_TEXT]
     conf = _resolve_confidence(confidence, source)
     try:
-        memories = _read_jsonl(_long_term_path())
+        memories = read_long_term()  # union across machines, minus tombstones
         if any(m.get("text") == text for m in memories):
             return {"success": False, "error": "already remembered"}
         if len(memories) >= _MAX_MEMORIES:
             return {"success": False,
                     "error": "memory is full; forget something first"}
         mem_id = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
-        _append_jsonl(_long_term_path(), {
+        # If this fact was previously forgotten, lift its tombstone instead of
+        # leaving the re-remember masked by the old suppression.
+        _remove_tombstones({mem_id})
+        _append_jsonl(_long_term_path(), {  # this machine's own shard
             "id": mem_id,
             "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "category": (category or None),
@@ -187,7 +296,7 @@ def tool_recall(query="", **_):
     """Return long-term memories whose text or category matches query (substring)."""
     query = (query or "").strip().lower()
     try:
-        memories = _read_jsonl(_long_term_path())
+        memories = read_long_term()
     except Exception as e:
         return {"success": False, "error": str(e)}
     if not query:
@@ -209,41 +318,52 @@ def tool_recall(query="", **_):
 
 
 def tool_forget(id="", **_):
-    """Drop the long-term memory with the given id, by id only (no bulk wipe)."""
+    """Drop the long-term memory with the given id, by id only (no bulk wipe).
+
+    The entry may live in any machine's shard, which we must not rewrite, so
+    forgetting records a tombstone that suppresses the id everywhere on read.
+    """
     mem_id = (id or "").strip()
     if not mem_id:
         return {"success": False, "error": "no id given"}
     try:
-        memories = _read_jsonl(_long_term_path())
-        kept = [m for m in memories if m.get("id") != mem_id]
-        if len(kept) == len(memories):
+        if not any(m.get("id") == mem_id for m in read_long_term()):
             return {"success": False, "error": "no memory with that id"}
-        _rewrite_jsonl(_long_term_path(), kept)
+        _add_tombstones({mem_id})
         return {"success": True, "id": mem_id}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def _gold_path():
+def _legacy_gold_path():
     return os.path.join(_MEMORY_DIR, "gold.json")
 
 
+def _gold_ledger_path():
+    return _shard_path("gold")
+
+
 def _read_gold():
-    """Current hoard total as an int; 0 if unset or corrupt."""
+    """Current hoard total as an int: the legacy base plus every shard's deltas.
+
+    The hoard is an append-only ledger of signed deltas, one shard per machine,
+    so two machines awarding/docking gold at once both persist and the sum is
+    correct. A legacy single-value gold.json (from before sharding) is folded in
+    as a starting base.
+    """
+    total = 0
     try:
-        with open(_gold_path(), "r") as f:
-            data = json.load(f)
-        return int(data.get("total", 0))
+        with open(_legacy_gold_path(), "r") as f:
+            total += int(json.load(f).get("total", 0))
     except (FileNotFoundError, ValueError, TypeError, OSError):
-        return 0
-
-
-def _write_gold(total):
-    _ensure_memory_dir()
-    with open(_gold_path(), "w") as f:
-        json.dump({"total": int(total),
-                   "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds")},
-                  f)
+        pass
+    for path in _shard_glob("gold"):
+        for entry in _read_jsonl(path):
+            try:
+                total += int(entry.get("delta", 0))
+            except (TypeError, ValueError):
+                continue
+    return total
 
 
 def tool_adjust_gold(amount=0, reason="", **_):
@@ -256,13 +376,18 @@ def tool_adjust_gold(amount=0, reason="", **_):
         return {"success": False, "error": "amount must be non-zero"}
     delta = max(-_MAX_GOLD_DELTA, min(_MAX_GOLD_DELTA, delta))
     before = _read_gold()
-    after = before + delta          # the only arithmetic — in code, never the LLM
     try:
-        _write_gold(after)
+        # The only arithmetic is the sum in _read_gold — never the LLM. We just
+        # append this machine's signed delta to its own ledger shard.
+        _append_jsonl(_gold_ledger_path(), {
+            "delta": delta,
+            "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "reason": (reason or "").strip() or None,
+        })
     except Exception as e:
         return {"success": False, "error": str(e)}
     return {"success": True, "change": delta, "previous": before,
-            "total": after, "reason": (reason or "").strip() or None}
+            "total": before + delta, "reason": (reason or "").strip() or None}
 
 
 def tool_gold_total(**_):
@@ -276,6 +401,7 @@ def record_short_term(label, text):
     if not text:
         return
     try:
+        # Append to and trim only this machine's own shard — never a peer's.
         _append_jsonl(_short_term_path(), {
             "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "label": label,
@@ -355,12 +481,24 @@ def apply_dream(raw):
             break
 
     try:
-        previous = _read_jsonl(_long_term_path())
-        # Back up the pre-dream store so a regrettable consolidation is recoverable.
-        _rewrite_jsonl(os.path.join(_MEMORY_DIR, "long_term.bak.jsonl"), previous)
+        previous = read_long_term()  # union of every machine's live memories
+        refined_ids = {m["id"] for m in refined}
+        # Back up the pre-dream store so a regrettable consolidation is
+        # recoverable, in this machine's own backup shard.
+        _rewrite_jsonl(
+            os.path.join(_MEMORY_DIR, f"long_term.{_machine_id()}.bak.jsonl"),
+            previous)
+        # The consolidated set lives in this machine's shard; peers' shards must
+        # not be rewritten, so suppress every prior id that the dream didn't keep
+        # verbatim. Anything carried forward unchanged (same content hash) is left
+        # untombstoned so it survives. Lift suppression on the kept ids too, in
+        # case a peer had previously forgotten one.
         _rewrite_jsonl(_long_term_path(), refined)
-        # The recent exchanges have been slept on; keep only a short tail for
-        # immediate continuity.
+        _remove_tombstones(refined_ids)
+        _add_tombstones({m.get("id") for m in previous
+                         if m.get("id") and m.get("id") not in refined_ids})
+        # The recent exchanges have been slept on; keep only a short tail of this
+        # machine's own short-term shard for immediate continuity.
         short = _read_jsonl(_short_term_path())
         if len(short) > _SHORT_TERM_AFTER_DREAM:
             _rewrite_jsonl(_short_term_path(), short[-_SHORT_TERM_AFTER_DREAM:])

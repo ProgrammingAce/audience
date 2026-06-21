@@ -101,3 +101,66 @@ def test_gold_rejects_zero_and_nonint(memory_dir):
 def test_gold_clamps_delta(memory_dir):
     r = core.tool_adjust_gold(amount=10 ** 9)
     assert r["change"] == core._MAX_GOLD_DELTA
+
+
+# --- cross-machine sharing (Dropbox-synced --memory-dir) --------------------
+
+def _as_machine(monkeypatch, name):
+    """Pretend the current process is running on host `name`."""
+    monkeypatch.setattr(core, "_machine_id", lambda: name)
+
+
+def test_writes_land_in_per_machine_shard(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    core.tool_remember(text="a fact")
+    import os
+    assert os.path.exists(os.path.join(str(memory_dir), "long_term.laptop.jsonl"))
+    assert not os.path.exists(os.path.join(str(memory_dir), "long_term.jsonl"))
+
+
+def test_recall_unions_across_machine_shards(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    core.tool_remember(text="written on the laptop")
+    _as_machine(monkeypatch, "desktop")
+    core.tool_remember(text="written on the desktop")
+    # From either machine, recall sees both shards.
+    texts = {m["text"] for m in core.tool_recall(query="")["matches"]}
+    assert texts == {"written on the laptop", "written on the desktop"}
+
+
+def test_duplicate_fact_across_machines_collapses(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    core.tool_remember(text="same fact")
+    _as_machine(monkeypatch, "desktop")
+    core.tool_remember(text="same fact")  # identical -> same content-hash id
+    assert core.tool_recall(query="")["count"] == 1
+
+
+def test_forget_suppresses_a_peers_memory(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    mem_id = core.tool_remember(text="a peer wrote this")["id"]
+    # A different machine forgets it; it must not need to rewrite the peer shard.
+    _as_machine(monkeypatch, "desktop")
+    assert core.tool_forget(id=mem_id)["success"]
+    assert core.tool_recall(query="peer")["count"] == 0
+    # The laptop's data shard is left intact; suppression is via a tombstone.
+    import os
+    assert os.path.exists(os.path.join(str(memory_dir), "long_term.laptop.jsonl"))
+
+
+def test_re_remember_lifts_own_tombstone(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    mem_id = core.tool_remember(text="on again off again")["id"]
+    core.tool_forget(id=mem_id)
+    assert core.tool_recall(query="again")["count"] == 0
+    assert core.tool_remember(text="on again off again")["success"]
+    assert core.tool_recall(query="again")["count"] == 1
+
+
+def test_gold_ledger_sums_across_machines(memory_dir, monkeypatch):
+    _as_machine(monkeypatch, "laptop")
+    core.tool_adjust_gold(amount=10)
+    _as_machine(monkeypatch, "desktop")
+    core.tool_adjust_gold(amount=-3)
+    # Both machines' deltas survive and the total is their sum.
+    assert core.tool_gold_total()["total"] == 7
