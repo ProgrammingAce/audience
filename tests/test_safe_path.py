@@ -2,7 +2,7 @@
 
 import os
 
-from audiencelib import core
+from audiencelib import tools as core
 
 
 def _set_workdir(monkeypatch, path):

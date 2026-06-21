@@ -3,7 +3,7 @@
 import json
 import os
 
-from audiencelib import core
+from audiencelib import memory as core
 
 
 def test_parse_dream_plain():

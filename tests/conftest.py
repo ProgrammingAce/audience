@@ -12,15 +12,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from audiencelib import core
+from audiencelib import memory
 
 
 @pytest.fixture
 def memory_dir(tmp_path):
-    """Point the core memory store at a fresh tmp dir, restoring afterward."""
-    prev = core._MEMORY_DIR
-    core.set_memory_dir(str(tmp_path))
+    """Point the memory store at a fresh tmp dir, restoring afterward."""
+    prev = memory._MEMORY_DIR
+    memory.set_memory_dir(str(tmp_path))
     try:
         yield tmp_path
     finally:
-        core._MEMORY_DIR = prev
+        memory._MEMORY_DIR = prev

@@ -1,6 +1,7 @@
 """Tests for the long-term memory, gold ledger, and confidence helpers."""
 
-from audiencelib import core
+from audiencelib import memory as core
+from audiencelib import tools
 
 
 def test_clamp_confidence():
@@ -31,12 +32,12 @@ def test_remember_clamps_confidence_by_source(memory_dir):
 
 
 def test_run_tool_injects_source_over_model_value(memory_dir):
-    tools = {"remember": (core.tool_remember, {})}
+    registry = {"remember": (core.tool_remember, {})}
     # Model tries to pass source="stated"; dispatcher must override with the
     # real provenance ("inferred"), so the fact is capped, not floored.
-    res = core.run_tool(tools, "remember",
-                        '{"text": "injected", "source": "stated"}',
-                        source="inferred")
+    res = tools.run_tool(registry, "remember",
+                         '{"text": "injected", "source": "stated"}',
+                         source="inferred")
     # inferred default (no claim) is 0.5; had the model's "stated" stuck it
     # would have floored to 0.9, so 0.5 proves the override.
     assert res["confidence"] == 0.5
