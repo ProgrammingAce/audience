@@ -13,6 +13,18 @@ commentary. You can also type questions about what's on screen.
 - `audiencelib/platform_macos.py`, `audiencelib/platform_windows.py` — the
   OS-specific probes (capture, idle/window detection, system stats).
 
+## Install
+
+Install the dependencies for your OS:
+
+```
+pip install -r requirements-macos.txt      # macOS
+pip install -r requirements-windows.txt    # Windows
+```
+
+If a dependency is missing, `audience.py` exits with a message pointing at the
+right requirements file rather than a raw traceback.
+
 ## Running
 
 Start a llama.cpp server first, then:
