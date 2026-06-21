@@ -193,7 +193,7 @@ class WindowsPlatform(Platform):
                     try:
                         pct = getattr(battery, "EstimatedChargeRemaining", None)
                         if pct is not None:
-                            charging = battery.Charging and battery.Charging != False
+                            charging = bool(battery.Charging)
                             return {"percent": int(pct),
                                     "state": "charging" if charging else "discharging"}
                     except Exception:
@@ -213,7 +213,9 @@ class WindowsPlatform(Platform):
             sys.stderr = _old
             _err.close()
 
-        # Last resort: WMIC
+        # Last resort: WMIC. Note: wmic is deprecated and absent on recent
+        # Windows 11 builds, so this fallback may simply fail there — that's
+        # fine, read_battery returns None and the stat is omitted.
         try:
             out = subprocess.check_output(
                 ["wmic", "path", "Win32_Battery", "get",
@@ -249,7 +251,14 @@ class WindowsPlatform(Platform):
             return None
 
     def read_loadavg(self):
-        """(1m, 5m, 15m) load averages via psutil, or None on failure."""
+        """(1m, 5m, 15m) load averages via psutil, or None on failure.
+
+        Windows has no native load average: psutil emulates it from an internal
+        sampling thread that it starts on first call, so this returns (0, 0, 0)
+        for roughly the first 5 seconds and only converges afterward. The health
+        watch's CPU check tolerates this — a (0, 0, 0) warm-up reads as idle and
+        simply won't fire, never as a false alarm.
+        """
         try:
             return psutil.getloadavg()
         except Exception:
@@ -276,19 +285,46 @@ class WindowsPlatform(Platform):
             return None
 
     def now_playing(self):
-        """Returns 'Spotify' if the Spotify desktop app is running, else ''."""
+        """Currently playing 'Track — Artist', or '' if nothing is playing.
+
+        Uses the Windows System Media Transport Controls (the same source that
+        feeds the volume-flyout "now playing" tile), so it reports whatever app
+        is actually playing — Spotify, a browser, a media player — with real
+        track metadata. Requires the optional ``winsdk`` package; if it's absent
+        or nothing is playing, returns '' rather than guessing from a process
+        list (the old behavior returned a misleading literal 'Spotify' whenever
+        the app merely existed, even paused).
+        """
         try:
-            for proc in psutil.process_iter(["name", "exe"]):
-                try:
-                    name = proc.info["name"] or ""
-                    exe = (proc.info["exe"] or "").lower()
-                    if "spotify" in name.lower() or "spotify" in exe:
-                        return "Spotify"
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+            return self._winrt_now_playing()
         except Exception:
-            pass
-        return ""
+            return ""
+
+    @staticmethod
+    def _winrt_now_playing():
+        import asyncio
+
+        from winsdk.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
+        )
+
+        async def _query():
+            mgr = await MediaManager.request_async()
+            session = mgr.get_current_session()
+            if session is None:
+                return ""
+            playback = session.get_playback_info()
+            if playback.playback_status != Status.PLAYING:
+                return ""
+            props = await session.try_get_media_properties_async()
+            title = (props.title or "").strip()
+            artist = (props.artist or "").strip()
+            if title and artist:
+                return f"{title} — {artist}"
+            return title or artist
+
+        return asyncio.run(_query())
 
     # --- session / UI lifecycle -------------------------------------------
     def enter_ui(self):
