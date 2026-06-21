@@ -1,0 +1,7 @@
+# macOS runtime dependencies.
+#   pip install -r requirements-macos.txt
+#
+# Screen capture, window/idle introspection, and PNG hashing all go through
+# Quartz/CoreGraphics, supplied by pyobjc. The rest (screencapture, pmset,
+# vm_stat, osascript, uptime) are stock macOS command-line tools.
+pyobjc-framework-Quartz>=9

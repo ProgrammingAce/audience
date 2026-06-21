@@ -39,10 +39,20 @@ from audiencelib import core
 
 def _platform_factory():
     if sys.platform == "darwin":
-        from audiencelib.platform_macos import MacPlatform
+        try:
+            from audiencelib.platform_macos import MacPlatform
+        except ImportError as e:
+            sys.exit(f"audience is missing a macOS dependency ({e.name}). "
+                     "Install them with:\n"
+                     "    pip install -r requirements-macos.txt")
         return MacPlatform()
     if sys.platform.startswith("win"):
-        from audiencelib.platform_windows import WindowsPlatform
+        try:
+            from audiencelib.platform_windows import WindowsPlatform
+        except ImportError as e:
+            sys.exit(f"audience is missing a Windows dependency ({e.name}). "
+                     "Install them with:\n"
+                     "    pip install -r requirements-windows.txt")
         return WindowsPlatform()
     sys.exit("audience supports macOS and Windows only "
              f"(this is {sys.platform!r}).")

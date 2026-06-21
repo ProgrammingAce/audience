@@ -1,0 +1,11 @@
+# Windows runtime dependencies.
+#   pip install -r requirements-windows.txt
+#
+# Screen capture (mss + Pillow), system stats (psutil), and battery info (wmi).
+# winsdk powers now_playing via the System Media Transport Controls; without it
+# now_playing simply returns "" rather than failing.
+mss>=9
+Pillow>=10
+psutil>=5.9
+wmi>=1.5
+winsdk>=1.0
