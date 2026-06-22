@@ -63,6 +63,29 @@ def test_remember_rejects_empty_and_dupes(memory_dir):
     assert core.tool_remember(text="builds a Rust CLI")["error"] == "already remembered"
 
 
+def test_remember_blocks_near_duplicates(memory_dir):
+    assert core.tool_remember(
+        text="the operator builds Rust command line tools")["success"]
+    # Same fact, reworded — should be refused as too similar, not stored twice.
+    dup = core.tool_remember(text="operator builds Rust command line apps")
+    assert not dup["success"]
+    assert "similar" in dup["error"]
+    assert core.tool_recall(query="rust")["count"] == 1
+    # A genuinely different fact still goes in.
+    assert core.tool_remember(
+        text="the operator lives in Seattle and likes coffee")["success"]
+
+
+def test_remember_near_dup_is_subject_scoped(memory_dir):
+    # A fact about the dragon itself must not block a similar one about the
+    # operator (and vice versa) — different subjects are different pools.
+    assert core.tool_remember(
+        text="enjoys hoarding shiny gold trinkets", subject="self")["success"]
+    assert core.tool_remember(
+        text="enjoys hoarding shiny gold trinkets",
+        subject="operator")["success"]
+
+
 def test_remember_truncates_long_text(memory_dir):
     long = "x" * (core._MAX_MEMORY_TEXT + 50)
     core.tool_remember(text=long)

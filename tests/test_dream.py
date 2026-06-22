@@ -112,6 +112,40 @@ def test_dream_does_not_merge_across_subjects(memory_dir):
     assert subjects == [core._SUBJECT_OPERATOR, core._SUBJECT_SELF]
 
 
+def test_dream_collapses_near_duplicates(memory_dir):
+    # The model's dream returns two barely-different facts about the operator
+    # plus a distinct one; the near-dups collapse to the strongest (highest
+    # confidence), and the distinct fact survives.
+    raw = json.dumps({"memories": [
+        {"text": "the operator writes Python code every day", "confidence": 0.6},
+        {"text": "the operator writes Python code daily", "confidence": 0.9},
+        {"text": "the operator drinks black coffee", "confidence": 0.7},
+    ]})
+    ok, info = core.apply_dream(raw)
+    assert ok and info == 2
+    survivors = {m["text"]: m for m in core.read_long_term()}
+    assert "the operator drinks black coffee" in survivors
+    python = [m for m in survivors.values() if "Python" in m["text"]]
+    assert len(python) == 1
+    assert python[0]["confidence"] == 0.9  # the strongest of the cluster kept
+
+
+def test_dream_collapse_keeps_a_pin_over_a_stronger_twin(memory_dir):
+    # A pinned fact must win a near-dup collapse even against a higher-confidence
+    # reworded twin the dream proposes.
+    core.tool_remember(text="the operator is named Ace Programmer",
+                       category="identity", source="stated")  # auto-pinned
+    raw = json.dumps({"memories": [
+        {"text": "operator goes by the name Ace Programmer", "confidence": 0.95},
+    ]})
+    ok, _ = core.apply_dream(raw)
+    assert ok
+    survivors = core.read_long_term()
+    assert len(survivors) == 1
+    assert survivors[0]["text"] == "the operator is named Ace Programmer"
+    assert survivors[0].get("pinned") is True
+
+
 def test_dream_does_not_resurrect_a_peers_originals(memory_dir, monkeypatch):
     # A peer machine wrote two facts into its own shard...
     monkeypatch.setattr(core, "_machine_id", lambda: "peer")

@@ -62,10 +62,20 @@ _DEFAULT_CONFIDENCE = 0.6
 _LOW_CONFIDENCE = 0.5    # at/under this, a fact is flagged tentative in the prompt
 _MIN_PROMPT_CONFIDENCE = 0.3  # below this, a fact is omitted from the prompt entirely
 
-# "Dream": a background pass that consolidates memory every _DREAM_EVERY exchanges
-# (or on /dream). After dreaming, short-term is trimmed to _SHORT_TERM_AFTER_DREAM
-# lines — the rest has been "slept on" and folded into long-term.
-_DREAM_EVERY = 10
+# "Dream": a background pass that consolidates memory (or runs on /dream). After
+# dreaming, short-term is trimmed to _SHORT_TERM_AFTER_DREAM lines — the rest has
+# been "slept on" and folded into long-term.
+#
+# Rather than dreaming every N exchanges, the trigger is "idle-plus-dirty": only
+# consolidate once at least _DREAM_MIN_DIRTY new exchanges have piled up AND the
+# operator has gone quiet for _DREAM_IDLE_SECONDS — mirroring "sleeping on it",
+# and keeping the model call out of the operator's active flow. A long session
+# that never goes idle still gets folded down at the _DREAM_MAX_DIRTY ceiling so
+# memory can't grow unbounded. The watcher re-checks every _DREAM_POLL_SECONDS.
+_DREAM_MIN_DIRTY = 8
+_DREAM_IDLE_SECONDS = 90.0
+_DREAM_MAX_DIRTY = 30
+_DREAM_POLL_SECONDS = 15.0
 _SHORT_TERM_AFTER_DREAM = 5
 
 # "Reflect": a synthesis pass run right after a successful dream. It derives a few
@@ -359,6 +369,16 @@ def tool_remember(text="", category=None, confidence=None, source=None,
                and _normalize_subject(m.get("subject")) == subject
                for m in memories):
             return {"success": False, "error": "already remembered"}
+        # Also refuse near-duplicates: a fact too similar to one already held
+        # (same subject) adds no signal and only grows a cluster the dream would
+        # later have to collapse. Catch it at the door instead.
+        sim, twin = _most_similar(text, subject, memories)
+        if sim >= _DUP_SIMILARITY:
+            return {"success": False,
+                    "error": ("already know something too similar: "
+                              f"\"{twin.get('text')}\""),
+                    "similar_to": twin.get("id"),
+                    "similarity": round(sim, 2)}
         if len(memories) >= _MAX_MEMORIES:
             return {"success": False,
                     "error": "memory is full; forget something first"}
@@ -392,6 +412,52 @@ def _tokenize(text):
     """Lowercase content-word tokens of `text`, dropping stopwords and glue."""
     words = re.findall(r"[a-z0-9]+", (text or "").lower())
     return {w for w in words if w not in _STOPWORDS and len(w) > 1}
+
+
+# Two facts about the SAME subject count as near-duplicates when their
+# content-word token sets overlap at least this much (Jaccard). New memories at
+# or above this bar are refused, and a dream collapses such clusters to one so
+# the store doesn't accrete piles of barely-different facts. This is a lexical
+# measure, not semantic: 0.5 catches most rewordings ("writes a lot of Python"
+# vs "mostly writes Python code") while leaving clearly distinct facts apart.
+# Tune up to block less aggressively, down to merge more. Very terse facts that
+# differ only in one content word (e.g. "uses Python" vs "uses Rust") can read
+# as similar here — the ≥2-token guard in _text_similarity and subject-scoping
+# limit the blast radius, but that's the inherent ceiling of token overlap.
+_DUP_SIMILARITY = 0.5
+
+
+def _text_similarity(a, b):
+    """Jaccard overlap of the content-word tokens of two facts (0.0..1.0).
+
+    Needs at least two content words on each side for the overlap to mean
+    anything — otherwise tiny facts that merely share a word, or whose only
+    distinguishing token (a digit, an initial) was filtered out, would look
+    identical. Exact duplicates are caught separately by the callers.
+    """
+    ta, tb = _tokenize(a), _tokenize(b)
+    if len(ta) < 2 or len(tb) < 2:
+        return 0.0
+    inter = len(ta & tb)
+    if not inter:
+        return 0.0
+    return inter / len(ta | tb)
+
+
+def _most_similar(text, subject, memories):
+    """Most similar same-subject memory to `text`, as (similarity, memory).
+
+    Returns (0.0, None) when nothing is close. Subject-scoped so a fact about the
+    dragon itself never blocks or merges into one about the operator.
+    """
+    best_sim, best = 0.0, None
+    for m in memories:
+        if _normalize_subject(m.get("subject")) != subject:
+            continue
+        sim = _text_similarity(text, m.get("text"))
+        if sim > best_sim:
+            best_sim, best = sim, m
+    return best_sim, best
 
 
 def _age_days(entry, now):
@@ -464,8 +530,17 @@ def tool_recall(query="", subject=None, **_):
     if not query:
         matches = memories
     else:
+        # Match on token overlap, not whole-query substring: the model asks in
+        # natural language ("what is my child's name"), which never appears
+        # verbatim in a fact, so a substring filter drops every candidate before
+        # the ranker can score it. A fact matches if it shares any content word
+        # with the query, OR contains the raw query as a substring (keeps exact
+        # phrase lookups working); _score_memory then ranks by overlap.
+        query_tokens = _tokenize(query)
         matches = [m for m in memories
-                   if query in (m.get("text") or "").lower()
+                   if (query_tokens & _tokenize(
+                           (m.get("text") or "") + " " + (m.get("category") or "")))
+                   or query in (m.get("text") or "").lower()
                    or query in (m.get("category") or "").lower()]
     matches = rank_memories(matches, query=query, limit=_RECALL_LIMIT)
     return {
@@ -750,6 +825,26 @@ def apply_dream(raw):
             entry["pinned"] = True
             entry["confidence"] = round(_clamp_confidence(
                 prior.get("confidence"), _DEFAULT_CONFIDENCE), 2)
+        # Collapse near-duplicates the model left behind: if this fact is too
+        # similar to one already kept for the same subject, keep only the
+        # stronger of the two rather than letting the cluster survive the dream.
+        # Preference: a pin always wins; otherwise higher confidence, then the
+        # longer (more specific) text.
+        twin_idx = next(
+            (i for i, k in enumerate(refined)
+             if k["subject"] == subject
+             and _text_similarity(text, k["text"]) >= _DUP_SIMILARITY),
+            None)
+        if twin_idx is not None:
+            kept = refined[twin_idx]
+            if kept.get("pinned"):
+                continue
+            if (bool(entry.get("pinned")),
+                    entry["confidence"], len(text)) > (
+                    bool(kept.get("pinned")),
+                    kept["confidence"], len(kept["text"])):
+                refined[twin_idx] = entry
+            continue
         refined.append(entry)
         if len(refined) >= _MAX_MEMORIES:
             break
@@ -763,6 +858,17 @@ def apply_dream(raw):
     dropped_pins = [m for m in previous
                     if m.get("pinned") and m.get("id") not in refined_ids_so_far]
     if dropped_pins:
+        # A re-injected pin also wins any near-dup collapse: drop a kept non-pin
+        # that merely rewords a pin we're restoring, so the pin doesn't return
+        # alongside a twin (the collapse loop above couldn't see these pins yet).
+        def _rewords_a_pin(e):
+            if e.get("pinned"):
+                return False
+            return any(
+                _normalize_subject(p.get("subject")) == e["subject"]
+                and _text_similarity(e["text"], p.get("text")) >= _DUP_SIMILARITY
+                for p in dropped_pins)
+        refined = [e for e in refined if not _rewords_a_pin(e)]
         refined = dropped_pins + refined
         refined = refined[:_MAX_MEMORIES]
 

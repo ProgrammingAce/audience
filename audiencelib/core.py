@@ -73,7 +73,8 @@ from .memory import (
     edit_memory, tool_remember, tool_forget,
     read_long_term, read_short_term, rank_memories, _age_days,
     _parse_dream, _clamp_confidence, _normalize_subject, _GOLD_CATEGORY,
-    _DEFAULT_CONFIDENCE, _DREAM_EVERY, _REFLECT_MIN_FACTS,
+    _DEFAULT_CONFIDENCE, _DREAM_MIN_DIRTY, _DREAM_IDLE_SECONDS,
+    _DREAM_MAX_DIRTY, _DREAM_POLL_SECONDS, _REFLECT_MIN_FACTS,
     _MEMORY_PROMPT_BUDGET, _LOW_CONFIDENCE, _MIN_PROMPT_CONFIDENCE,
     _SUBJECT_SELF,
 )
@@ -198,9 +199,15 @@ class Audience:
         self.health_enabled = health_enabled
         self.health_state = {}
         self._last_batt = None
-        # Exchanges since the last memory "dream"; at _DREAM_EVERY we enqueue a
-        # background consolidation pass (also triggerable on demand via /dream).
+        # Idle-plus-dirty dream trigger. msgs_since_dream is the count of
+        # unconsolidated ("dirty") exchanges; last_exchange_at stamps the last
+        # one so the dream watcher can tell how long things have been quiet.
+        # Both are touched from the worker (increment) and the dream-watcher
+        # thread (read/reset), so dream_lock guards them. A dream is also
+        # triggerable on demand via /dream.
         self.msgs_since_dream = 0
+        self.last_exchange_at = time.monotonic()
+        self.dream_lock = threading.Lock()
         # /memories editor: a modal overlay for browsing and editing long-term
         # memory. mem_active gates the overlay; mem_sub is the inner mode
         # (list / edit / add / confirm), mem_sel the highlighted row, mem_buf the
@@ -482,10 +489,35 @@ class Audience:
         self._note_exchange()
 
     def _note_exchange(self):
-        """Count a completed exchange; dream once enough have piled up."""
-        self.msgs_since_dream += 1
-        if self.msgs_since_dream >= _DREAM_EVERY:
-            self.msgs_since_dream = 0
+        """Record a completed exchange for the idle-plus-dirty dream trigger.
+
+        Bumps the unconsolidated-exchange count and stamps the time so the dream
+        watcher can tell how long things have been quiet. The decision to dream
+        is left to dream_scheduler — we never fire mid-exchange.
+        """
+        with self.dream_lock:
+            self.msgs_since_dream += 1
+            self.last_exchange_at = time.monotonic()
+
+    def dream_scheduler(self):
+        """Idle-plus-dirty dream trigger.
+
+        Periodically checks whether enough new exchanges have accumulated AND
+        the operator has gone quiet long enough to "sleep on it"; if so, enqueue
+        a consolidation pass. A hard ceiling forces a dream during a long,
+        never-idle session so memory can't grow unbounded.
+        """
+        while not self.stop.is_set():
+            if self.stop.wait(_DREAM_POLL_SECONDS):
+                return
+            with self.dream_lock:
+                dirty = self.msgs_since_dream
+                idle = time.monotonic() - self.last_exchange_at
+                ready = dirty >= _DREAM_MIN_DIRTY and idle >= _DREAM_IDLE_SECONDS
+                forced = dirty >= _DREAM_MAX_DIRTY
+                if not (ready or forced):
+                    continue
+                self.msgs_since_dream = 0
             self.jobs.put(("dream", None))
 
     def _dream(self):
@@ -522,6 +554,10 @@ class Audience:
             return
         ok, info = apply_dream(raw)
         if ok:
+            # Backlog is folded in — clear the dirty count so an on-demand
+            # /dream doesn't leave the watcher poised to re-fire immediately.
+            with self.dream_lock:
+                self.msgs_since_dream = 0
             self.emit(f"I dozed, and tidied my hoard — {info} memories now.",
                       style="hint")
             # Having tidied the hoard, look once for the larger shape of it.
@@ -1331,6 +1367,7 @@ class Audience:
 
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.scheduler, daemon=True).start()
+        threading.Thread(target=self.dream_scheduler, daemon=True).start()
         if self.health_enabled:
             threading.Thread(target=self.health_scheduler, daemon=True).start()
 
