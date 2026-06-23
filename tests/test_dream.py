@@ -160,3 +160,52 @@ def test_dream_does_not_resurrect_a_peers_originals(memory_dir, monkeypatch):
     # them from re-surfacing on the union read.
     texts = [m["text"] for m in core.tool_recall(query="")["matches"]]
     assert texts == ["merged peer facts"]
+
+
+def test_dream_caps_insight_confidence(memory_dir):
+    # The model returns an insight at full certainty (as the corroboration loop
+    # would push it); the dream must hold it to the reflected ceiling so a hedged
+    # deduction can't outrank concrete facts.
+    raw = json.dumps({"memories": [
+        {"category": "insight", "text": "the operator likes detail",
+         "confidence": 1.0},
+        {"category": "project", "text": "the operator builds a cyberdeck",
+         "confidence": 0.9},
+    ]})
+    ok, _ = core.apply_dream(raw)
+    assert ok
+    by_text = {m["text"]: m for m in core.read_long_term()}
+    assert by_text["the operator likes detail"]["confidence"] == core._REFLECTED_CEILING
+    # a non-insight fact is unaffected by the cap
+    assert by_text["the operator builds a cyberdeck"]["confidence"] == 0.9
+
+
+def test_dream_collapses_insights_at_looser_bar(memory_dir):
+    # Two insights whose similarity (~0.38) sits between the insight bar (0.35) and
+    # the general bar (0.5): they collapse because both are insights, where the same
+    # pair as ordinary facts would survive. (Genuinely reworded dups below 0.35 are
+    # beyond any token check and rely on the model + throttling instead.)
+    a = "operator values precise granular technical detail"
+    b = "operator values granular mechanical rigor"
+    assert (core._INSIGHT_DUP_SIMILARITY
+            <= core._text_similarity(a, b) < core._DUP_SIMILARITY)
+    raw = json.dumps({"memories": [
+        {"category": "insight", "subject": "operator", "text": a, "confidence": 0.7},
+        {"category": "insight", "subject": "operator", "text": b, "confidence": 0.6},
+    ]})
+    ok, _ = core.apply_dream(raw)
+    assert ok
+    insights = [m for m in core.read_long_term()
+                if m["category"] == core._INSIGHT_CATEGORY]
+    assert len(insights) == 1
+
+
+def test_add_insights_capped_at_total(memory_dir):
+    insights = [{"text": f"insight number {i}", "confidence": 0.6}
+                for i in range(core._MAX_INSIGHTS_TOTAL + 4)]
+    # Per-pass cap limits one call, so add across enough passes to hit the total.
+    for _ in range(core._MAX_INSIGHTS_TOTAL + 4):
+        core.add_insights(insights)
+    live = [m for m in core.read_long_term()
+            if m["category"] == core._INSIGHT_CATEGORY]
+    assert len(live) == core._MAX_INSIGHTS_TOTAL

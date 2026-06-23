@@ -73,6 +73,7 @@ from .memory import (
     edit_memory, tool_remember, tool_forget,
     read_long_term, read_short_term, rank_memories, _age_days,
     _parse_dream, _clamp_confidence, _normalize_subject, _GOLD_CATEGORY,
+    _INSIGHT_CATEGORY,
     _DEFAULT_CONFIDENCE, _DREAM_MIN_DIRTY, _DREAM_IDLE_SECONDS,
     _DREAM_MAX_DIRTY, _DREAM_POLL_SECONDS, _REFLECT_MIN_FACTS,
     _MEMORY_PROMPT_BUDGET, _LOW_CONFIDENCE, _MIN_PROMPT_CONFIDENCE,
@@ -540,6 +541,13 @@ class Audience:
             return
 
         now = dt.datetime.now().astimezone()
+        # Group facts so near-duplicates sit adjacent in the prompt: a small model
+        # merges items it sees side by side far more reliably than ones scattered
+        # through a long list. Same subject+category (all insights, all stack facts,
+        # …) become contiguous blocks.
+        long_term.sort(key=lambda m: (_normalize_subject(m.get("subject")),
+                                      m.get("category") or "",
+                                      m.get("text") or ""))
         facts = "\n".join(self._fact_line(m, now) for m in long_term) or "(none)"
         transcript = "\n".join(
             f"{e.get('label', '?')}: {e.get('text', '')}" for e in short_term) or "(none)"
@@ -585,8 +593,12 @@ class Audience:
         facts. Skipped when there's too little to generalize from; any bad or empty
         response simply adds nothing.
         """
+        # Reflect only over ground truth — exclude prior insights so it can't
+        # generalize over its own earlier generalizations, which is what let one
+        # idea bloom into dozens of reworded near-dup insights.
         long_term = [m for m in read_long_term()
-                     if m.get("category") != _GOLD_CATEGORY]
+                     if m.get("category") not in (_GOLD_CATEGORY,
+                                                   _INSIGHT_CATEGORY)]
         if len(long_term) < _REFLECT_MIN_FACTS:
             return
         now = dt.datetime.now().astimezone()
@@ -911,6 +923,11 @@ class Audience:
         """
         rows, pos, used = [""], [], 0
         for ch in text:
+            if ch == "\n":
+                pos.append((len(rows) - 1, used))  # caret before the newline
+                rows.append("")
+                used = 0
+                continue
             cw = _char_width(ch)
             if used + cw > width:
                 rows.append("")
@@ -920,6 +937,22 @@ class Audience:
             used += cw
         pos.append((len(rows) - 1, used))        # caret at the very end
         return rows, pos
+
+    @classmethod
+    def _vertical_caret(cls, text, c, width, up):
+        """Caret index one wrapped row above/below, keeping the column if it can."""
+        c = max(0, min(c, len(text)))
+        _, pos = cls._layout_text(text, max(1, width))
+        cur_row, cur_col = pos[c]
+        target = cur_row - 1 if up else cur_row + 1
+        if target < 0 or target > pos[-1][0]:
+            return c  # no row in that direction — stay put
+        best = None
+        for i, (r, col) in enumerate(pos):
+            if r == target and (best is None
+                                or abs(col - cur_col) < abs(pos[best][1] - cur_col)):
+                best = i
+        return c if best is None else best
 
     def _cursor_vertical(self, up):
         """Caret index one wrapped row above/below, keeping the column if it can."""
@@ -1224,7 +1257,7 @@ class Audience:
             pass
 
     # --- curses UI ---------------------------------------------------------
-    def render(self, stdscr, buf):
+    def render(self, stdscr, buf, cur=None):
         if self.mem_active:
             self._render_memories(stdscr)
             if self.mem_sub == "detail":
@@ -1234,7 +1267,25 @@ class Audience:
             stdscr.refresh()
             return
         h, w = stdscr.getmaxyx()
-        out_h = h - 2  # leave bottom 2 rows for separator + input
+
+        # Lay out the input buffer first: it can wrap onto several rows and the
+        # box grows upward, so how many rows it needs determines how much space
+        # is left for the conversation log above it.
+        prompt = "> "
+        if cur is None:
+            cur = len(buf)
+        cur = max(0, min(cur, len(buf)))
+        in_w = max(1, w - 1 - len(prompt))
+        in_rows, in_pos = self._layout_text(buf, in_w)
+        cur_row, cur_col = in_pos[cur]
+        # Cap the box height so it never eats more than half the screen; scroll
+        # within the buffer to keep the caret's row visible.
+        max_in = max(1, min(len(in_rows), max(1, (h - 2) // 2)))
+        in_top = 0
+        if cur_row >= max_in:
+            in_top = cur_row - max_in + 1
+        in_h = min(len(in_rows) - in_top, max_in)
+        out_h = h - in_h - 1  # rows above the separator for the log
 
         # The dragon is pinned to the top-right corner. Reserve its columns by
         # wrapping all text to a dragon-aware width, so no line ever wraps past
@@ -1320,19 +1371,27 @@ class Audience:
                     except curses.error:
                         pass
 
-        # separator + input
+        # separator + input. The input box occupies the bottom `in_h` rows; the
+        # separator sits just above it.
+        sep_row = h - in_h - 1
         sep = "─" * (w - 1)
         try:
-            stdscr.addstr(h - 2, 0, sep, curses.A_DIM)
+            stdscr.addstr(sep_row, 0, sep, curses.A_DIM)
         except curses.error:
             pass
-        prompt = "> "
-        shown = (prompt + buf)[-(w - 1):]
-        try:
-            stdscr.addstr(h - 1, 0, shown, curses.A_BOLD)
-        except curses.error:
-            pass
-        stdscr.move(h - 1, min(len(prompt) + len(buf), w - 1))
+        for i in range(in_h):
+            row = in_top + i
+            text = in_rows[row]
+            lead = prompt if row == 0 else " " * len(prompt)
+            try:
+                stdscr.addstr(sep_row + 1 + i, 0,
+                              (lead + text)[:w - 1], curses.A_BOLD)
+            except curses.error:
+                pass
+        # Park the hardware cursor at the caret, inside the box.
+        cy = sep_row + 1 + (cur_row - in_top)
+        cx = min(len(prompt) + cur_col, w - 1)
+        stdscr.move(cy, cx)
         stdscr.refresh()
 
     def run(self, stdscr):
@@ -1372,10 +1431,11 @@ class Audience:
             threading.Thread(target=self.health_scheduler, daemon=True).start()
 
         buf = ""
+        cur = 0  # caret position within buf (0..len(buf))
         esc = 0  # escape-sequence state: 0=none, 1=saw ESC, 2=saw ESC[
         esc_at = 0.0  # monotonic time we entered esc==1, to flush a lone ESC
         while not self.stop.is_set():
-            self.render(stdscr, buf)
+            self.render(stdscr, buf, cur)
             try:
                 ch = stdscr.get_wch()
             except curses.error:
@@ -1392,6 +1452,7 @@ class Audience:
                 time.sleep(0.05)
                 continue
             if isinstance(ch, str):
+                alt = False  # set when this char followed a lone ESC (Alt+key)
                 # Focus-reporting events arrive as the chars ESC, '[', 'I'/'O'.
                 # Intercept them before they reach the prompt buffer.
                 if esc == 0 and ch == "\x1b":
@@ -1403,6 +1464,7 @@ class Audience:
                         esc = 2
                         continue
                     esc = 0
+                    alt = True
                     # A lone ESC (not the start of a focus sequence). Deliver it
                     # to the editor as a cancel/close, then handle the char that
                     # followed — unless that char is itself ESC, in which case
@@ -1426,22 +1488,51 @@ class Audience:
                     self._memories_key(ch)
                     continue
                 if ch in ("\n", "\r"):
-                    self.handle_submit(buf)
-                    buf = ""
-                elif ch in ("\x7f", "\b"):  # backspace
-                    buf = buf[:-1]
+                    if alt:                 # Alt+Enter inserts a newline
+                        buf = buf[:cur] + "\n" + buf[cur:]
+                        cur += 1
+                    else:                   # Enter submits
+                        self.handle_submit(buf)
+                        buf = ""
+                        cur = 0
+                elif ch in ("\x7f", "\b"):  # backspace: delete before caret
+                    if cur > 0:
+                        buf = buf[:cur - 1] + buf[cur:]
+                        cur -= 1
                 elif ch == "\x03":          # Ctrl-C
                     self.stop.set()
                 elif ch == "\x15":          # Ctrl-U clear line
                     buf = ""
-                elif ch.isprintable():
-                    buf += ch
+                    cur = 0
+                elif ch == "\x01":          # Ctrl-A: start of line
+                    cur = 0
+                elif ch == "\x05":          # Ctrl-E: end of line
+                    cur = len(buf)
+                elif ch.isprintable():      # insert at the caret
+                    buf = buf[:cur] + ch + buf[cur:]
+                    cur += 1
             else:
                 if self.mem_active:
                     self._memories_key(ch)
                     continue
                 if ch == curses.KEY_BACKSPACE:
-                    buf = buf[:-1]
+                    if cur > 0:
+                        buf = buf[:cur - 1] + buf[cur:]
+                        cur -= 1
+                elif ch == curses.KEY_DC:           # forward delete
+                    buf = buf[:cur] + buf[cur + 1:]
+                elif ch == curses.KEY_LEFT:
+                    cur = max(0, cur - 1)
+                elif ch == curses.KEY_RIGHT:
+                    cur = min(len(buf), cur + 1)
+                elif ch == curses.KEY_HOME:
+                    cur = 0
+                elif ch == curses.KEY_END:
+                    cur = len(buf)
+                elif ch in (curses.KEY_UP, curses.KEY_DOWN):
+                    h, w = stdscr.getmaxyx()
+                    cur = self._vertical_caret(buf, cur, w - 3,
+                                               ch == curses.KEY_UP)
                 elif ch == curses.KEY_PPAGE:
                     self.scroll += 5
                 elif ch == curses.KEY_NPAGE:

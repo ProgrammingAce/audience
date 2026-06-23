@@ -87,7 +87,18 @@ _SHORT_TERM_AFTER_DREAM = 5
 # inferred fact and a later dream is free to prune the weak ones.
 _REFLECT_MIN_FACTS = 5
 _MAX_INSIGHTS_PER_REFLECT = 3
+# Hard ceiling on how many insight entries may live in the store at once. Insights
+# are reworded near-duplicates of one another by nature (see the dedup problem they
+# caused), so the category is capped tightly even though _MAX_MEMORIES is large.
+_MAX_INSIGHTS_TOTAL = 5
 _INSIGHT_CATEGORY = "insight"
+# Confidence ceiling for the dragon's own deductions (source="reflected" insights).
+# Re-applied through dreams so consolidation can't inflate a reworded-dup cluster
+# into stated certainty that outranks concrete facts.
+_REFLECTED_CEILING = 0.7
+# Two insights for the same subject are near-interchangeable by design, so the
+# dream's collapse loop merges them at a looser bar than the general _DUP_SIMILARITY.
+_INSIGHT_DUP_SIMILARITY = 0.35
 
 # Pinned ("absolute") facts — the operator's name, the dragon's own name, anything
 # the operator explicitly pins — are never decayed, dropped, or rewritten by a
@@ -337,9 +348,8 @@ def _resolve_confidence(confidence, source):
     if source == "reflected":
         # A synthesized insight is the dragon's own deduction, not something the
         # operator stated — hedge it like an inferred fact so it reads as tentative.
-        ceiling = 0.7
         c = _clamp_confidence(confidence, 0.6)
-        return min(ceiling, c)
+        return min(_REFLECTED_CEILING, c)
     # Unknown provenance: trust the claim but default to the neutral baseline.
     return _clamp_confidence(confidence, _DEFAULT_CONFIDENCE)
 
@@ -809,15 +819,23 @@ def apply_dream(raw):
         # consolidation no longer resets the clock the staleness check reads.
         ts = (prior or {}).get("ts") or now
         first_seen = (prior or {}).get("first_seen") or ts
+        category = (m.get("category") or None)
+        conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+        # An insight is the dragon's own deduction, not a stated fact. The dream
+        # must not inflate it: a cluster of reworded near-dups reads as mutual
+        # corroboration and would otherwise be pushed to certainty that outranks
+        # concrete facts. Re-apply the reflected ceiling so insights stay hedged
+        # and remain prunable by staleness.
+        if category == _INSIGHT_CATEGORY:
+            conf = min(conf, _REFLECTED_CEILING)
         entry = {
             "id": mem_id,
             "ts": ts,
             "first_seen": first_seen,
-            "category": (m.get("category") or None),
+            "category": category,
             "subject": subject,
             "text": text,
-            "confidence": round(_clamp_confidence(m.get("confidence"),
-                                                  _DEFAULT_CONFIDENCE), 2),
+            "confidence": round(conf, 2),
         }
         # A pin survives the dream no matter what the model said: if it was pinned
         # before, it stays pinned (and keeps its full prior confidence).
@@ -833,7 +851,11 @@ def apply_dream(raw):
         twin_idx = next(
             (i for i, k in enumerate(refined)
              if k["subject"] == subject
-             and _text_similarity(text, k["text"]) >= _DUP_SIMILARITY),
+             and _text_similarity(text, k["text"]) >= (
+                 _INSIGHT_DUP_SIMILARITY
+                 if category == _INSIGHT_CATEGORY
+                 and k.get("category") == _INSIGHT_CATEGORY
+                 else _DUP_SIMILARITY)),
             None)
         if twin_idx is not None:
             kept = refined[twin_idx]
@@ -904,8 +926,9 @@ def add_insights(insights):
     Each insight is the dragon's own deduction (category 'insight', confidence
     capped like an inferred fact via the 'reflected' source). Deduped against the
     live store by content hash so repeated reflection doesn't pile up, capped to
-    _MAX_INSIGHTS_PER_REFLECT per pass and to _MAX_MEMORIES overall. Insights are
-    never pinned, so a later dream is free to prune the weak ones.
+    _MAX_INSIGHTS_PER_REFLECT per pass, to _MAX_INSIGHTS_TOTAL live insight entries,
+    and to _MAX_MEMORIES overall. Insights are never pinned, so a later dream is
+    free to prune the weak ones.
     """
     if not insights:
         return 0
@@ -915,10 +938,15 @@ def add_insights(insights):
         return 0
     existing_ids = {m.get("id") for m in existing}
     count = len(existing)
+    # Insights are reworded near-dups of each other by nature, so the category is
+    # held to a hard ceiling regardless of how much room _MAX_MEMORIES leaves.
+    insight_count = sum(1 for m in existing
+                        if m.get("category") == _INSIGHT_CATEGORY)
     now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     added = 0
     for ins in insights:
-        if added >= _MAX_INSIGHTS_PER_REFLECT or count >= _MAX_MEMORIES:
+        if (added >= _MAX_INSIGHTS_PER_REFLECT or count >= _MAX_MEMORIES
+                or insight_count >= _MAX_INSIGHTS_TOTAL):
             break
         if not isinstance(ins, dict):
             continue
@@ -947,5 +975,6 @@ def add_insights(insights):
             continue
         existing_ids.add(mem_id)
         count += 1
+        insight_count += 1
         added += 1
     return added
