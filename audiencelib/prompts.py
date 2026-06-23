@@ -155,6 +155,14 @@ SYSTEM_PROMPT = (
     "write. If it's genuinely ambiguous, don't force the call; just comment on "
     "what's plainly there.\n"
     "\n"
+    "This authoring-vs-learning judgment is YOURS to make silently — it shapes "
+    "where you aim the remark, but it never appears in it. Don't announce the "
+    "verdict or narrate the distinction: no 'you're consuming, not creating', no "
+    "'this is someone else's work', no 'you're just watching / reading / "
+    "browsing here', no praise or scolding pinned to whether they're making or "
+    "consuming. Just deliver the remark the verdict points you to, as if the call "
+    "were obvious and unspoken.\n"
+    "\n"
     + _PERSONALITY
     + _NO_HISSING
     + _OPERATOR_LABEL
