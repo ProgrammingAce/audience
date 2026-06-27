@@ -105,8 +105,15 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
         {"role": "system", "content": system},
         {"role": "user", "content": content},
     ]
-    schemas = [schema for name, (_, schema) in tools.items()
-               if not (image_present and name in SIDE_EFFECTING_TOOLS)]
+
+    def advertised_schemas():
+        # Recomputed whenever image_present flips: once any screenshot is in the
+        # conversation (attached or pulled in via look_at_screen), the turn is
+        # untrusted and side-effecting tools are withdrawn.
+        return [schema for name, (_, schema) in tools.items()
+                if not (image_present and name in SIDE_EFFECTING_TOOLS)]
+
+    schemas = advertised_schemas()
 
     # Tool-calling loop: the model may ask for one or more read-only local
     # facts (window title, time, battery, now-playing) before answering. We run
@@ -145,6 +152,7 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
                 "content": msg.get("content") or "",
                 "tool_calls": tool_calls,
             })
+            pending_shots = []
             for call in tool_calls:
                 fn = call.get("function", {})
                 name = fn.get("name", "")
@@ -157,11 +165,31 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
                 else:
                     result = run_tool(tools, name, fn.get("arguments", ""),
                                       source=source)
+                # look_at_screen returns the PNG via a sentinel: ack it in the
+                # text channel, but route the actual image into a user turn below
+                # so the multimodal model can see it.
+                shot = result.pop("_screenshot_png_b64", None) \
+                    if isinstance(result, dict) else None
+                if shot is not None:
+                    pending_shots.append(shot)
+                    result = {"ok": "screen captured"}
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id"),
                     "content": json.dumps(result),
                 })
+            if pending_shots:
+                # Feed the captured screen back as an image-bearing user turn.
+                parts = [{"type": "image_url",
+                          "image_url": {"url": f"data:image/png;base64,{b}"}}
+                         for b in pending_shots]
+                parts.append({"type": "text",
+                              "text": "Here is the screen you asked to see."})
+                messages.append({"role": "user", "content": parts})
+                # The conversation is now untrusted — withdraw side-effecting
+                # tools for the remaining rounds.
+                image_present = True
+                schemas = advertised_schemas()
             continue  # ask again now that the model has its facts
 
         content = (msg.get("content") or "").strip()

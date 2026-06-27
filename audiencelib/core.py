@@ -135,6 +135,9 @@ DRAGON_SPARKLE_MS = 1500  # how long the dragon sparkles after a screenshot
 # Token budget for direct operator questions (typed, or asked with /screenshot).
 # Periodic commentary and health pings stay terse on the default 450.
 LONG_REPLY_TOKENS = 1200
+# How long periodic screenshot commentary is paused after a voice command, so
+# the dragon doesn't talk over the operator's spoken exchange.
+VOICE_COMMENTARY_PAUSE = 30.0
 # A spoken command is answered on the remote's e-ink panel, which fits exactly
 # 374 characters (34 cols x 11 rows). Ask the dragon to keep it short, cap the
 # token budget to match, and hard-truncate as a guarantee.
@@ -143,7 +146,8 @@ VOICE_REPLY_TOKENS = 160
 VOICE_BREVITY = (
     "\n\nThis answer will be shown on a tiny e-ink panel: reply in at most "
     "374 characters — a sentence or two, no lists. Be terse but stay in "
-    "full dragon voice.")
+    "full dragon voice. If the request is about what's on the operator's "
+    "screen, call look_at_screen first to see it.")
 # Sparkle glyphs and the cells (row, col) around the 12x5 dragon box where a
 # shiny dragon twinkles. A rotating subset lights up each tick.
 DRAGON_SPARKLES = ['✦', '✧', '·', '*']
@@ -203,6 +207,10 @@ class Audience:
         # True while the worker is mid-model-call, so a remote that just sent a
         # voice command can tell when the reply has fully completed.
         self.generating = False
+        # monotonic deadline before which periodic screenshot commentary is
+        # suppressed — bumped when a voice command arrives so the dragon attends
+        # to the operator instead of talking over the spoken exchange.
+        self.commentary_pause_until = 0.0
         self.log = []                    # list of (style, text, transient) raw lines
         self.log_lock = threading.Lock()
         self.scroll = 0                  # lines scrolled up from bottom
@@ -417,6 +425,10 @@ class Audience:
                     question, on_demand = payload
                 else:
                     question, on_demand = payload, False
+                # Skip a periodic glance while a recent voice command holds the
+                # floor; an on-demand /screenshot is an explicit ask, so honor it.
+                if not on_demand and time.monotonic() < self.commentary_pause_until:
+                    return
                 # a /screenshot carrying an operator question deserves a fuller
                 # answer; a plain periodic glance stays a quick remark.
                 max_tokens = LONG_REPLY_TOKENS if (on_demand and question) else 450
@@ -856,6 +868,9 @@ class Audience:
         text = (text or "").strip()
         if not text:
             return
+        # Hold off periodic commentary so the dragon focuses on the spoken
+        # exchange rather than narrating the screen over the reply.
+        self.commentary_pause_until = time.monotonic() + VOICE_COMMENTARY_PAUSE
         self.jobs.put(("voice", text))
 
     # --- /memories editor (modal overlay) ---------------------------------

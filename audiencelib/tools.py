@@ -5,6 +5,7 @@ the working-directory-confined file tools and wires every tool
 (including the platform probes) into the registry build_tools returns.
 """
 
+import base64
 import json
 import os
 
@@ -163,6 +164,15 @@ def build_tools(platform):
         track = platform.now_playing()
         return {"now_playing": track or "(nothing playing)"}
 
+    def tool_look_at_screen(**_):
+        """Capture the operator's screen. The PNG is returned via a sentinel
+        key that ask_model's loop intercepts and feeds back as an image; the
+        model never sees the raw base64 in the text channel."""
+        img = platform.capture()
+        if img is None:
+            return {"error": "screen capture failed"}
+        return {"_screenshot_png_b64": base64.b64encode(img).decode()}
+
     tools = {
         "now": (tool_now, {
             "type": "function",
@@ -194,6 +204,16 @@ def build_tools(platform):
                 "name": "now_playing",
                 "description": "Get the song currently playing in Music or Spotify, "
                                "if anything is playing.",
+                "parameters": {"type": "object", "properties": {}},
+            }}),
+        "look_at_screen": (tool_look_at_screen, {
+            "type": "function",
+            "function": {
+                "name": "look_at_screen",
+                "description": "Capture and look at the operator's current "
+                               "screen. Call this when the spoken request refers "
+                               "to what's on screen (e.g. 'what am I looking at', "
+                               "'read this', 'what's this error').",
                 "parameters": {"type": "object", "properties": {}},
             }}),
         "read_file": (tool_read_file, {
