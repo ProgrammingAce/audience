@@ -81,6 +81,7 @@ from .memory import (
 )
 from .tools import build_tools
 from .llm import ask_model
+from .server import start_server
 
 
 def _char_width(ch):
@@ -134,6 +135,15 @@ DRAGON_SPARKLE_MS = 1500  # how long the dragon sparkles after a screenshot
 # Token budget for direct operator questions (typed, or asked with /screenshot).
 # Periodic commentary and health pings stay terse on the default 450.
 LONG_REPLY_TOKENS = 1200
+# A spoken command is answered on the remote's e-ink panel, which fits exactly
+# 374 characters (34 cols x 11 rows). Ask the dragon to keep it short, cap the
+# token budget to match, and hard-truncate as a guarantee.
+EINK_CHAR_LIMIT = 374
+VOICE_REPLY_TOKENS = 160
+VOICE_BREVITY = (
+    "\n\nThis answer will be shown on a tiny e-ink panel: reply in at most "
+    "374 characters — a sentence or two, no lists. Be terse but stay in "
+    "full dragon voice.")
 # Sparkle glyphs and the cells (row, col) around the 12x5 dragon box where a
 # shiny dragon twinkles. A rotating subset lights up each tick.
 DRAGON_SPARKLES = ['✦', '✧', '·', '*']
@@ -143,6 +153,22 @@ DRAGON_SPARKLE_CELLS = [(0, 1), (0, 10), (1, 0), (2, 11), (4, 0), (4, 11), (1, 6
 def hamming(a, b):
     """Number of differing bits between two integer hashes."""
     return bin(a ^ b).count("1")
+
+
+def _truncate_chars(text, limit):
+    """Trim ``text`` to at most ``limit`` characters, ending with an ellipsis.
+
+    Cuts on a word boundary when one is reasonably close to the limit so the
+    last word isn't sliced mid-letter; the ellipsis is counted in the budget.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1].rstrip()
+    space = cut.rfind(" ")
+    if space >= limit - 1 - 40:  # only back up to a space if it's nearby
+        cut = cut[:space].rstrip()
+    return cut + "…"
 
 
 # --------------------------------------------------------------------------
@@ -174,6 +200,9 @@ class Audience:
         # quiet stretch, so we announce the lull once rather than every skip.
         self.lull_announced = False
         self.jobs = queue.Queue()        # (kind, payload)
+        # True while the worker is mid-model-call, so a remote that just sent a
+        # voice command can tell when the reply has fully completed.
+        self.generating = False
         self.log = []                    # list of (style, text, transient) raw lines
         self.log_lock = threading.Lock()
         self.scroll = 0                  # lines scrolled up from bottom
@@ -374,6 +403,13 @@ class Audience:
                 kind, payload = self.jobs.get(timeout=0.25)
             except queue.Empty:
                 continue
+            self.generating = True
+            try:
+                self._dispatch(kind, payload)
+            finally:
+                self.generating = False
+
+    def _dispatch(self, kind, payload):
             if kind == "commentary":
                 # payload is (question, on_demand); legacy None means a plain
                 # periodic shot with no operator request.
@@ -399,6 +435,15 @@ class Audience:
                 self._do(question=payload, system=QA_SYSTEM_PROMPT,
                           screenshot=False, max_tokens=LONG_REPLY_TOKENS,
                           source="stated")
+            elif kind == "voice":
+                # payload is the transcript of a command the operator spoke on
+                # the remote (transcribed there). Treat it exactly like a typed
+                # question — same prompt, same "stated" trust — but tag it with
+                # the mic glyph so its origin is visible.
+                self.emit(f"you: 🎤 {payload}", style="you")
+                self._do(question=payload, system=QA_SYSTEM_PROMPT + VOICE_BREVITY,
+                          screenshot=False, max_tokens=VOICE_REPLY_TOKENS,
+                          source="stated", max_chars=EINK_CHAR_LIMIT)
             elif kind == "health":
                 # health pings don't save memories; leave provenance unset.
                 self._do(question=payload, system=HEALTH_SYSTEM_PROMPT,
@@ -407,7 +452,7 @@ class Audience:
                 self._dream()
 
     def _do(self, question, system, screenshot, on_demand=False, max_tokens=450,
-            source=None):
+            source=None, max_chars=None):
         image = None
         if screenshot:
             # pause periodic commentary while the operator is away: no point
@@ -481,6 +526,11 @@ class Audience:
         except Exception as e:
             self._set_line(entry, prefix, f"model call failed: {e}", style="error")
             return
+        # A spoken command is bound for the e-ink panel: enforce its character
+        # budget so an over-long reply can't overflow the display, even if the
+        # model ignored the brevity instruction.
+        if max_chars is not None:
+            answer = _truncate_chars(answer, max_chars)
         # Overwrite with the final text (so a reasoning-only fallback that never
         # streamed content still shows), optionally tagged with timing, then
         # persist the clean answer to short-term memory exactly once.
@@ -793,6 +843,20 @@ class Audience:
             self.emit(f"unknown command: {text}", style="error")
             return
         self.jobs.put(("question", text))
+
+    def submit_voice(self, text):
+        """Enqueue a transcribed spoken command from the remote as a question.
+
+        ``text`` is the transcript the remote produced (it runs speech-to-text
+        on-device, since the host model takes text, not audio). The worker shows
+        it as a mic-tagged operator question and answers normally. Called from
+        the state server's ``POST /command`` handler (off the curses thread), so
+        it only touches the thread-safe job queue.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        self.jobs.put(("voice", text))
 
     # --- /memories editor (modal overlay) ---------------------------------
     def _open_memories(self):
@@ -1429,6 +1493,11 @@ class Audience:
         threading.Thread(target=self.dream_scheduler, daemon=True).start()
         if self.health_enabled:
             threading.Thread(target=self.health_scheduler, daemon=True).start()
+        # Optional read-only state server so a remote mirror (e.g. a Pi e-ink
+        # display) can fetch what's on screen. Off unless --serve was passed.
+        if getattr(self, "serve", False):
+            start_server(self, getattr(self, "serve_host", "0.0.0.0"),
+                         getattr(self, "serve_port", 8770))
 
         buf = ""
         cur = 0  # caret position within buf (0..len(buf))
@@ -1573,6 +1642,13 @@ def main(platform_factory):
     ap.add_argument("--show-timing", action="store_true",
                     help="append the AI server's response time to each message "
                          "(off by default)")
+    ap.add_argument("--serve", action="store_true",
+                    help="expose a read-only HTTP state server so a remote "
+                         "agent can mirror the screen (off by default)")
+    ap.add_argument("--serve-host", default="0.0.0.0",
+                    help="address the state server binds to (default 0.0.0.0)")
+    ap.add_argument("--serve-port", type=int, default=8770,
+                    help="port for the state server (default 8770)")
     ap.add_argument("--memory-dir", default=None,
                     help="directory for the dragon's persistent memory (default: "
                          ".audience_memory beside the working directory). Point it "
@@ -1591,6 +1667,9 @@ def main(platform_factory):
                    show_timing=args.show_timing)
     if args.no_shiny:
         app.shiny = False
+    app.serve = args.serve
+    app.serve_host = args.serve_host
+    app.serve_port = args.serve_port
     platform.begin_session()
     try:
         curses.wrapper(app.run)
