@@ -39,12 +39,14 @@ def test_low_confidence_fact_is_tagged_unsure(memory_dir):
     assert "maybe likes tea (unsure)" in ctx
 
 
-def test_gold_is_not_inlined(memory_dir):
-    # The hoard total is pulled on demand via gold_total, never pushed.
+def test_hoard_block_is_inlined(memory_dir):
+    # The hoard is now pushed in as a compact summary: total + mood.
     memory.tool_adjust_gold(amount=500)
     ctx = _app()._memory_context() or ""
-    assert "gold" not in ctx.lower()
-    assert "500" not in ctx
+    assert "gold" in ctx.lower()
+    assert "500" in ctx
+    # Also contains "hoard" from the block prefix.
+    assert "hoard" in ctx.lower()
 
 
 def test_recent_exchanges_are_inlined(memory_dir):
@@ -58,7 +60,8 @@ def test_recent_exchanges_are_inlined(memory_dir):
 
 
 def test_empty_when_nothing_recent(memory_dir):
-    # No recent exchanges (long-term/gold never inline) -> no context block.
+    # No recent exchanges, no long-term, and no legacy gold -> no context block.
+    # (The memory_dir fixture gives an empty dir; no gold.json exists by default.)
     assert _app()._memory_context() is None
 
 

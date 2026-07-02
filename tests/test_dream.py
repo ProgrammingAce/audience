@@ -8,23 +8,43 @@ from audiencelib import memory as core
 
 def test_parse_dream_plain():
     raw = '{"memories": [{"text": "a", "confidence": 0.9}]}'
-    assert core._parse_dream(raw) == [{"text": "a", "confidence": 0.9}]
+    mems, ep = core._parse_dream(raw)
+    assert mems == [{"text": "a", "confidence": 0.9}]
+    assert ep is None
 
 
 def test_parse_dream_code_fence():
     raw = '```json\n{"memories": [{"text": "a"}]}\n```'
-    assert core._parse_dream(raw) == [{"text": "a"}]
+    mems, ep = core._parse_dream(raw)
+    assert mems == [{"text": "a"}]
+    assert ep is None
 
 
 def test_parse_dream_surrounding_prose():
     raw = 'Here you go:\n{"memories": []}\nhope that helps'
-    assert core._parse_dream(raw) == []
+    mems, ep = core._parse_dream(raw)
+    assert mems == []
+    assert ep is None
 
 
 def test_parse_dream_garbage():
-    assert core._parse_dream("not json at all") is None
-    assert core._parse_dream("") is None
-    assert core._parse_dream('{"nope": 1}') is None
+    assert core._parse_dream("not json at all") == (None, None)
+    assert core._parse_dream("") == (None, None)
+    assert core._parse_dream('{"nope": 1}') == (None, None)
+
+
+def test_parse_dream_with_episode():
+    raw = '{"memories": [], "episode": "debugging a race condition"}'
+    mems, ep = core._parse_dream(raw)
+    assert mems == []
+    assert ep == "debugging a race condition"
+
+
+def test_parse_dream_episode_null():
+    raw = '{"memories": [], "episode": null}'
+    mems, ep = core._parse_dream(raw)
+    assert mems == []
+    assert ep is None
 
 
 def test_apply_dream_rewrites_and_backs_up(memory_dir):
@@ -201,8 +221,11 @@ def test_dream_collapses_insights_at_looser_bar(memory_dir):
 
 
 def test_add_insights_capped_at_total(memory_dir):
-    insights = [{"text": f"insight number {i}", "confidence": 0.6}
-                for i in range(core._MAX_INSIGHTS_TOTAL + 4)]
+    insights = [{"text": f"operator enjoys {thing}", "confidence": 0.6}
+                for thing in [
+                    "hiking", "salsa dancing", "fermenting kimchi",
+                    "restoring vintage radios", "competitive chess",
+                    "woodworking", "star gazing"]]
     # Per-pass cap limits one call, so add across enough passes to hit the total.
     for _ in range(core._MAX_INSIGHTS_TOTAL + 4):
         core.add_insights(insights)

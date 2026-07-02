@@ -307,6 +307,16 @@ class MacPlatform(Platform):
         except Exception:
             return ""
 
+    def read_clipboard(self):
+        """Current clipboard text via pbpaste, or None on failure."""
+        try:
+            r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2)
+            if r.returncode == 0:
+                return r.stdout
+            return None
+        except Exception:
+            return None
+
     # --- session / UI lifecycle -------------------------------------------
     def enter_ui(self):
         # Ask the terminal to report focus changes (ESC[I / ESC[O) so we know

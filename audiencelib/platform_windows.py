@@ -326,6 +326,40 @@ class WindowsPlatform(Platform):
 
         return asyncio.run(_query())
 
+    def read_clipboard(self):
+        """Current clipboard text via ctypes/win32clipboard or PowerShell fallback."""
+        # Try the ctypes path first (requires STA thread).
+        try:
+            import ctypes
+            import ctypes.wintypes
+            if not ctypes.windll.user32.OpenClipboard(0):
+                raise RuntimeError("OpenClipboard failed")
+            try:
+                h = ctypes.windll.user32.GetClipboardData(1)  # CF_UNICODETEXT
+                if h:
+                    ptr = ctypes.windll.kernel32.GlobalLock(h)
+                    if ptr:
+                        text = ctypes.wintypes.LPCWSTR(ptr).value
+                        ctypes.windll.kernel32.GlobalUnlock(h)
+                        ctypes.windll.user32.CloseClipboard()
+                        return text
+            finally:
+                ctypes.windll.user32.CloseClipboard()
+        except Exception:
+            pass  # broad except: probes never raise per design rule
+
+        # PowerShell fallback — runs in a fresh process, sidesteps STA entirely.
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0:
+                return r.stdout or None
+            return None
+        except Exception:
+            return None
+
     # --- session / UI lifecycle -------------------------------------------
     def enter_ui(self):
         # Ask the terminal to report focus changes (ESC[I / ESC[O) so the shared

@@ -66,7 +66,7 @@ import unicodedata
 
 from .prompts import (
     SYSTEM_PROMPT, QA_SYSTEM_PROMPT, HEALTH_SYSTEM_PROMPT, DREAM_SYSTEM_PROMPT,
-    REFLECT_SYSTEM_PROMPT,
+    REFLECT_SYSTEM_PROMPT, REMINDER_SYSTEM_PROMPT, SESSION_SUMMARY_PROMPT,
 )
 from .memory import (
     set_memory_dir, record_short_term, apply_dream, add_insights, set_pinned,
@@ -76,11 +76,19 @@ from .memory import (
     _INSIGHT_CATEGORY,
     _DEFAULT_CONFIDENCE, _DREAM_MIN_DIRTY, _DREAM_IDLE_SECONDS,
     _DREAM_MAX_DIRTY, _DREAM_POLL_SECONDS, _REFLECT_MIN_FACTS,
-    _MEMORY_PROMPT_BUDGET, _LOW_CONFIDENCE, _MIN_PROMPT_CONFIDENCE,
-    _SUBJECT_SELF,
+    _MEMORY_PROMPT_BUDGET_TOKENS, _LOW_CONFIDENCE, _MIN_PROMPT_CONFIDENCE,
+    _estimate_tokens,
+    _SUBJECT_SELF, _is_commentary_dup,
+    read_episodes, scan_stale_reminders,
+    _read_jsonl, _rewrite_jsonl, _append_jsonl, _shard_glob, _machine_id,
+    _long_term_path, _SHORT_TERM_KEEP,
+    _mem_id, _add_tombstones,
+    hoard_mood, _humanize_age, _collect_all_events, _read_gold,
+    tool_adjust_gold, tool_list_treasures, tool_gold_history,
+    _HOARD_MOOD_MAX_TREASURE_NAMES, _HOARD_MOOD_BLOCK_MAX_CHARS,
 )
 from .tools import build_tools
-from .llm import ask_model
+from .llm import ask_model, DREAM_RESPONSE_FORMAT, REFLECT_RESPONSE_FORMAT
 from .server import start_server
 
 
@@ -339,8 +347,9 @@ class Audience:
         of looking. Inlining the top-ranked facts (pinned absolutes first, then by
         relevance/confidence/recency) up to _MEMORY_PROMPT_BUDGET chars gives it
         continuity for free; recall still exists for searching beyond this slice.
-        The gold hoard stays pull-only (the gold_total tool), since its single
-        number rarely bears on a given turn.
+        The gold hoard is pushed in as a compact summary line (total + top
+        treasures + mood), so trend information colors commentary without the
+        model needing to call gold_total first.
         """
         blocks = []
         try:
@@ -350,6 +359,15 @@ class Audience:
         fact_block = self._format_facts(facts)
         if fact_block:
             blocks.append(fact_block)
+        # Episodic summaries: last 5 dated session one-liners.
+        try:
+            episodes = read_episodes()
+        except Exception:
+            episodes = []
+        if episodes:
+            ep_lines = [f"- {e.get('date', '?')}: {e.get('text', '')}"
+                        for e in episodes]
+            blocks.append("Recent sessions:\n" + "\n".join(ep_lines))
         try:
             recent = read_short_term()[-recent_limit:]
         except Exception:
@@ -357,20 +375,77 @@ class Audience:
         if recent:
             lines = [f"{e.get('label', '?')}: {e.get('text', '')}" for e in recent]
             blocks.append("Recent exchange:\n" + "\n".join(lines))
+        # Hoard block: total + newest treasure names + mood phrase.
+        try:
+            hoard_block = self._hoard_block()
+            if hoard_block:
+                blocks.append(hoard_block)
+        except Exception:
+            pass
         if not blocks:
             return None
         return "\n\n" + "\n\n".join(blocks) + "\n\n"
+
+    def _hoard_block(self):
+        """Build the compact hoard line injected after other memory blocks.
+
+        One line: total + up to 5 newest treasure names + mood phrase (when
+        not content). Hard-capped at ~300 chars to avoid prompt bloat.
+        Returns None when there's nothing meaningful to report (e.g. total 0
+        with no treasures and no mood).
+        """
+        try:
+            total = _read_gold()
+        except Exception:
+            return None
+        try:
+            list_result = tool_list_treasures()
+            treasures = list_result.get("treasures", [])
+        except Exception:
+            treasures = []
+        try:
+            mood_key, phrase = hoard_mood()
+        except Exception:
+            mood_key, phrase = ("content", None)
+        # Skip the block entirely when there's nothing meaningful:
+        # total 0, no treasures, and content mood (no phrase).
+        if total == 0 and not treasures and mood_key == "content" and phrase is None:
+            return None
+        # Build treasure names slice (up to 5 newest).
+        names = [t.get("name", "?") for t in treasures[:_HOARD_MOOD_MAX_TREASURE_NAMES]]
+        # Assemble the block.
+        parts = [f"Your hoard: {total} gold"]
+        if names:
+            parts[-1] += ". Treasures: " + "; ".join(names)
+        if phrase:
+            parts.append(phrase)
+        block = ". ".join(parts)
+        if len(block) > _HOARD_MOOD_BLOCK_MAX_CHARS and names:
+            # Drop oldest names to fit.
+            for i in range(len(names) - 1, 0, -1):
+                names = names[:i]
+                trial_parts = [f"Your hoard: {total} gold"]
+                trial_parts[-1] += ". Treasures: " + "; ".join(names)
+                if phrase:
+                    trial_parts.append(phrase)
+                    trial_parts[-1]  # ensure phrase is last
+                    block = ". ".join(trial_parts)
+                else:
+                    block = ". ".join(trial_parts)
+                if len(block) <= _HOARD_MOOD_BLOCK_MAX_CHARS:
+                    break
+        return block if block.strip() else None
 
     @staticmethod
     def _format_facts(facts):
         """Render the highest-value long-term facts for inlining, or None.
 
         Facts below _MIN_PROMPT_CONFIDENCE are dropped (too weak to state); the
-        rest are ranked pinned-first and packed until _MEMORY_PROMPT_BUDGET chars
-        run out, so a full store can't crowd the prompt. Operator and self facts
-        go under separate headers — the dragon's own name must never be confused
-        with the operator's — and a low-confidence fact is tagged '(unsure)' so the
-        model hedges it rather than stating it flat.
+        rest are ranked pinned-first and packed until _MEMORY_PROMPT_BUDGET_TOKENS
+        est. tokens run out, so a full store can't crowd the prompt. Operator and
+        self facts go under separate headers — the dragon's own name must never be
+        confused with the operator's — and a low-confidence fact is tagged
+        '(unsure)' so the model hedges it rather than stating it flat.
         """
         usable = [m for m in facts
                   if m.get("category") != _GOLD_CATEGORY
@@ -379,14 +454,14 @@ class Audience:
         if not usable:
             return None
         operator_lines, self_lines = [], []
-        budget = _MEMORY_PROMPT_BUDGET
+        budget = _MEMORY_PROMPT_BUDGET_TOKENS
         for m in rank_memories(usable):
             text = (m.get("text") or "").strip()
             if not text:
                 continue
             conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
             line = "- " + text + (" (unsure)" if conf <= _LOW_CONFIDENCE else "")
-            budget -= len(line) + 1
+            budget -= _estimate_tokens(line)
             # Pinned absolutes are always kept (they rank first, so they're packed
             # before the budget can run out); a later fact that overflows is dropped.
             if budget < 0 and not m.get("pinned"):
@@ -462,6 +537,24 @@ class Audience:
                           screenshot=False)
             elif kind == "dream":
                 self._dream()
+            elif kind == "reminder":
+                # A note scribbled for the creature has come due. Deliver it
+                # in one short line, dragon voice, quoting the reminder text
+                # verbatim. If the model call fails fall back to the raw line.
+                try:
+                    raw = ask_model(self.url, None,
+                                    f"Reminder text: {payload}",
+                                    REMINDER_SYSTEM_PROMPT, {},
+                                    max_tokens=160, temperature=0.3,
+                                    response_format=None)
+                    if raw:
+                        self.emit(raw, style="model")
+                        record_short_term("Dragon", raw)
+                    else:
+                        self.emit(f"\u23f0 reminder: {payload}", style="model")
+                except Exception:
+                    self.emit(f"\u23f0 reminder: {payload}", style="model")
+                record_short_term("Dragon", f"reminder: {payload}")
 
     def _do(self, question, system, screenshot, on_demand=False, max_tokens=450,
             source=None, max_chars=None):
@@ -538,6 +631,61 @@ class Audience:
         except Exception as e:
             self._set_line(entry, prefix, f"model call failed: {e}", style="error")
             return
+
+        # Strip hissing openings and other canned text the model likes to
+        # generate — code is deterministic, prompt prose alone isn't.
+        answer = self._strip_hiss(answer)
+
+        # Vary commentary openings: if the first 2 literal tokens match the
+        # last 2 dragon lines in short-term memory, reroll once with a nudge.
+        # Only for commentary (source == "inferred"); Q&A has its own persona.
+        if source == "inferred":
+            opening = self._extract_opening(answer)
+            if opening:
+                try:
+                    recent_short = read_short_term()
+                except Exception:
+                    recent_short = []
+                dragon_openings = []
+                for e in recent_short[-2:]:
+                    if (e.get("label", "") or "").lower() == "dragon":
+                        dragon_openings.append(self._extract_opening(e.get("text", "")))
+                if any(o == opening for o in dragon_openings):
+                    nudge = ("\n\nYou already opened your last remark that way "
+                             "— same observation, different opening.")
+                    try:
+                        t0 = time.monotonic()
+                        answer = ask_model(self.url, image, question, system + nudge,
+                                           self.tools, max_tokens=max_tokens,
+                                           source=source, on_delta=None)
+                        elapsed = time.monotonic() - t0
+                    except Exception:
+                        pass  # keep original; best effort.
+
+        # Commentary dedup: if this is a periodic shot and the answer matches
+        # any recent dragon remark (>=0.8 similarity), reroll once with a nudge.
+        # If the reroll also matches, drop silently — never emit the same line
+        # twice on unchanged screens.
+        if source == "inferred":
+            try:
+                recent_short = read_short_term()
+            except Exception:
+                recent_short = []
+            if _is_commentary_dup(answer, recent_short):
+                nudge = ("\n\nYou already said that — find a different detail "
+                         "or stay silent.")
+                try:
+                    t0 = time.monotonic()
+                    answer = ask_model(self.url, image, question, system + nudge,
+                                       self.tools, max_tokens=max_tokens,
+                                       source=source, on_delta=None)
+                    elapsed = time.monotonic() - t0
+                except Exception:
+                    pass  # keep original; best effort.
+                if _is_commentary_dup(answer, recent_short):
+                    # Still a dup after reroll — drop silently.
+                    self._set_line(entry, prefix, "…", style="hint")
+                    return
         # A spoken command is bound for the e-ink panel: enforce its character
         # budget so an over-long reply can't overflow the display, even if the
         # model ignored the brevity instruction.
@@ -613,12 +761,18 @@ class Audience:
         facts = "\n".join(self._fact_line(m, now) for m in long_term) or "(none)"
         transcript = "\n".join(
             f"{e.get('label', '?')}: {e.get('text', '')}" for e in short_term) or "(none)"
+        # Gold ledger digest: last ~15 ledger reasons for consolidation.
+        gold_events = _collect_all_events(limit=15)
+        gold_digest = "\n".join(
+            f"- {e.get('reason', '(no reason)')}" for e in gold_events[:15]) or "- (no recent gold activity)"
         user_msg = ("Current long-term memories:\n" + facts
                     + "\n\nRecent transcript:\n" + transcript
+                    + "\n\nGold ledger (recent):\n" + gold_digest
                     + "\n\nReturn the cleaned, consolidated memories as JSON.")
         try:
             raw = ask_model(self.url, None, user_msg, DREAM_SYSTEM_PROMPT, {},
-                            max_tokens=1200)
+                            max_tokens=1200, temperature=0.15,
+                            response_format=DREAM_RESPONSE_FORMAT)
         except Exception as e:
             self.emit(f"dream fizzled: {e}", style="error")
             return
@@ -632,10 +786,46 @@ class Audience:
                       style="hint")
             # Having tidied the hoard, look once for the larger shape of it.
             self._reflect()
+            # Summarize the session from the pre-trim snapshot.
+            self._summarize_session(short_term)
         else:
             self.emit(f"my dream came out muddled ({info}); memories left as they "
                       "were.", style="hint", transient=True)
 
+    @staticmethod
+    def _strip_hiss(text):
+        """Remove a leading hissing/breathing sound and re-capitalize.
+
+        Strips patterns like "Hssss. ", "*hiss* ", "Pshh, " from the start
+        of text, then capitalizes the first letter of whatever remains.
+        """
+        import re
+        stripped = re.sub(
+            r"^(?:[*(]?\s*)?(?:h+i*s{2,}|p?sh{2,})[.,!…:;\s)*]*",
+            "", text, flags=re.IGNORECASE)
+        if not stripped:
+            return text
+        stripped = stripped.lstrip()
+        if not stripped:
+            return text
+        return stripped[0].upper() + stripped[1:]
+
+    @staticmethod
+    def _extract_opening(text):
+        """Extract the first 3 whitespace-delimited tokens, lowercased, punctuation-stripped.
+
+        Returns a string like "the morsel returns" suitable for comparing
+        opening shapes between consecutive remarks.
+        """
+        tokens = text.split()
+        if not tokens:
+            return ""
+        cleaned = []
+        for tok in tokens[:3]:
+            cleaned.append(tok.strip("()\"'*,.!?…:;–—/\\|<>[]{}"))
+        return " ".join(cleaned).lower()
+
+    @staticmethod
     @staticmethod
     def _fact_line(m, now):
         """One long-term fact rendered for the dream, with its age, subject, pin."""
@@ -643,8 +833,15 @@ class Audience:
         pin = " (pinned)" if m.get("pinned") else ""
         age = f"{int(_age_days(m, now))}d"
         subject = _normalize_subject(m.get("subject"))
+        date_suffix = ""
+        if not m.get("pinned") and m.get("first_seen"):
+            try:
+                fs = m["first_seen"][:10]  # YYYY-MM-DD
+                date_suffix = f" (learned {fs})"
+            except (IndexError, TypeError):
+                pass
         return (f"- id={m.get('id')} conf={conf} age={age} subject={subject}{pin} "
-                f"[{m.get('category') or 'uncategorized'}] {m.get('text', '')}")
+                f"[{m.get('category') or 'uncategorized'}] {m.get('text', '')}{date_suffix}")
 
     def _reflect(self):
         """Synthesis pass after a dream: derive a few higher-level insights.
@@ -665,15 +862,20 @@ class Audience:
             return
         now = dt.datetime.now().astimezone()
         facts = "\n".join(self._fact_line(m, now) for m in long_term)
+        # Exclude Dragon commentary — it's the dragon's roleplay voice, not
+        # evidence of the operator's preferences. Only the operator's own turns
+        # ("You") are meaningful signal for generalization.
         transcript = "\n".join(
             f"{e.get('label', '?')}: {e.get('text', '')}"
-            for e in read_short_term()) or "(none)"
+            for e in read_short_term()
+            if e.get("label", "").lower() != "dragon") or "(none)"
         user_msg = ("Your long-term facts:\n" + facts
-                    + "\n\nRecent transcript:\n" + transcript
+                    + "\n\nRecent transcript (operator turns only):\n" + transcript
                     + "\n\nReturn higher-level insights as JSON.")
         try:
             raw = ask_model(self.url, None, user_msg, REFLECT_SYSTEM_PROMPT, {},
-                            max_tokens=600)
+                            max_tokens=600, temperature=0.15,
+                            response_format=REFLECT_RESPONSE_FORMAT)
         except Exception:
             return  # reflection is a bonus; never surface its failure
         insights = _parse_dream(raw)
@@ -800,6 +1002,112 @@ class Audience:
                 if key not in active:
                     del self.health_state[key]
 
+    # --- reminder scheduler ------------------------------------------------
+    def reminder_scheduler(self):
+        """Independent loop: every 15 s checks for due reminders and fires them.
+
+        Each host schedules only reminders from its own shard.  A fired reminder
+        is queued as ("reminder", text) so the worker delivers it through the
+        model (dragon-voice one-liner).  Only after the job completes is the
+        fired record appended to the ledger.
+        """
+        # Startup sweep: fire reminders that came due while the app was asleep.
+        try:
+            stale_texts = scan_stale_reminders()
+            if stale_texts:
+                self.emit("while I dozed, this came due:", style="hint")
+                for text in stale_texts:
+                    self.jobs.put(("reminder", text))
+        except Exception:
+            pass
+        while True:
+            if self.stop.wait(15):
+                return
+            now = dt.datetime.now().astimezone()
+            try:
+                by_id = {}
+                for p in _shard_glob("reminders"):
+                    for r in _read_jsonl(p):
+                        rid = r.get("id")
+                        if rid:
+                            by_id[rid] = r
+                pending = {rid: r for rid, r in by_id.items()
+                           if r.get("status") == "pending"}
+                for rid, r in pending.items():
+                    try:
+                        due_dt = dt.datetime.fromisoformat(
+                            r.get("due_dt", "") or r.get("due", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    if due_dt <= now:
+                        self.jobs.put(("reminder", r.get("text", "")))
+                        _append_jsonl(p, {
+                            "id": rid, "status": "fired",
+                            "ts": now.isoformat(timespec="seconds"),
+                        })
+            except Exception:
+                pass  # scheduler never breaks the app
+
+    # --- session summary ---------------------------------------------------
+    def _summarize_session(self, snapshot):
+        """One-shot summary of the session since the last summary.
+
+        Input: a snapshot of the short-term transcript (captured *before*
+        apply_dream trims it).  Skips unless ≥ 8 exchanges.  The result is
+        stored as a `session`-category long-term fact.
+        """
+        if not snapshot or len(snapshot) < 8:
+            return
+        now = dt.datetime.now().astimezone()
+        date_str = now.strftime("%Y-%m-%d")
+        transcript = "\n".join(
+            f"{e.get('label', '?')}: {e.get('text', '')}" for e in snapshot) or "(none)"
+        try:
+            raw = ask_model(self.url, None,
+                            f"Recent exchanges:\n{transcript}",
+                            SESSION_SUMMARY_PROMPT, {},
+                            max_tokens=200, temperature=0.3)
+        except Exception:
+            return  # best-effort; never surface failure
+
+        text = (raw or "").strip()
+        if not text:
+            return
+        if len(text) > 500:
+            text = text[:500]
+        # Store as session fact, prefixed with date.
+        full_text = f"{date_str}: {text}" if not text.startswith(date_str) else text
+        mem_id = _mem_id(full_text, _SUBJECT_OPERATOR)
+
+        # Dedup: at most one summary per calendar day per host.
+        existing = [m for m in read_long_term()
+                     if m.get("category") == "session"]
+        today_entries = [m for m in existing if m.get("text", "").startswith(date_str)]
+        if today_entries:
+            # Tombstone the old one.
+            old_id = today_entries[0].get("id")
+            if old_id:
+                _add_tombstones({old_id})
+            existing = [m for m in existing if m.get("id") != old_id]
+
+        # Retention: keep 7 most recent session facts.
+        existing = sorted(existing, key=lambda m: m.get("ts") or "", reverse=True)
+        if len(existing) >= 7:
+            # Tombstone the oldest.
+            oldest = existing[-1]
+            _add_tombstones({oldest.get("id")})
+            existing = existing[:-1]
+
+        _append_jsonl(_long_term_path(), {
+            "id": mem_id,
+            "ts": now.isoformat(timespec="seconds"),
+            "first_seen": now.isoformat(timespec="seconds"),
+            "category": "session",
+            "subject": "operator",
+            "text": text,
+            "confidence": 0.7,
+        })
+
     # --- input handling ----------------------------------------------------
     def handle_submit(self, text):
         text = text.strip()
@@ -848,13 +1156,87 @@ class Audience:
             return
         if text == "/help":
             self.emit("commands: /screenshot [question], /dream, /memories, "
-                      "/pin <id>, /unpin <id>, /quit  — or type a question",
+                      "/pin <id>, /unpin <id>, /gold [±N [reason]], /quit  — or type a question",
                       style="hint")
+            return
+        # /gold command
+        if text.startswith("/gold"):
+            self._handle_gold(text[5:].strip())
             return
         if text.startswith("/"):
             self.emit(f"unknown command: {text}", style="error")
             return
         self.jobs.put(("question", text))
+
+    def _handle_gold(self, rest):
+        """Handle the /gold TUI command: view ledger or adjust it."""
+        if not rest:
+            self._emit_gold_view()
+            return
+        # Parse /gold +N [reason] or /gold -N [reason]
+        sign = 1
+        text = rest.strip()
+        if text.startswith("+"):
+            text = text[1:].strip()
+        elif text.startswith("-"):
+            sign = -1
+            text = text[1:].strip()
+        elif not rest[0] in "+-" and rest[0].isdigit():
+            pass  # plain number, treated as positive
+        parts = text.split(None, 1)
+        try:
+            delta = sign * int(parts[0])
+        except (IndexError, ValueError):
+            self.emit("/gold: invalid amount — use /gold +N [reason] or /gold -N [reason]",
+                      style="error")
+            return
+        reason = parts[1] if len(parts) > 1 else ""
+        result = tool_adjust_gold(amount=delta, reason=reason, source="operator")
+        if not result.get("success"):
+            self.emit(f"/gold: {result.get('error')}", style="error")
+            return
+        clamped_str = " (clamped)" if result.get("clamped") else ""
+        self.emit(f"/gold: {delta:+d} gold → {result['total']} — {reason or '(no reason)'}{clamped_str}",
+                  style="hint")
+
+    def _emit_gold_view(self):
+        """Emit the /gold view report as hint lines."""
+        total = _read_gold()
+        mood_key, phrase = hoard_mood()
+        header = f"{total:+d} gold"
+        if phrase:
+            header += f" — {phrase}"
+        self.emit(header, style="hint")
+        # Last 10 events merged from gold + treasure shards.
+        now = dt.datetime.now().astimezone()
+        events = _collect_all_events(limit=10)
+        hosts_seen = set()
+        for e in events:
+            hosts_seen.add(e.get("source", "unknown"))
+        has_multi_host = len(hosts_seen) > 1
+        for e in events:
+            delta = e["delta"]
+            sign = "+" if delta >= 0 else ""
+            amount = f"{sign}{delta}"
+            age = _humanize_age(e["ts"], now=now, compact=True)
+            reason = e.get("reason") or "(no reason)"
+            # Pad amount/age for alignment (not critical, but clean).
+            line = f"  {amount:>5}  {age:>4s}   {reason}"
+            if has_multi_host:
+                host = e.get("source", "?")
+                line += f"    ({host})"
+            self.emit(line, style="hint")
+        # Treasure summary line.
+        try:
+            list_result = tool_list_treasures()
+            treasures = list_result.get("treasures", [])
+            if treasures:
+                t_parts = []
+                for t in treasures:
+                    t_parts.append(f"{t['name']} ({t['tier']}, {t['cost']})")
+                self.emit("treasures: " + " · ".join(t_parts), style="hint")
+        except Exception:
+            pass
 
     def submit_voice(self, text):
         """Enqueue a transcribed spoken command from the remote as a question.
@@ -1508,6 +1890,7 @@ class Audience:
         threading.Thread(target=self.dream_scheduler, daemon=True).start()
         if self.health_enabled:
             threading.Thread(target=self.health_scheduler, daemon=True).start()
+        threading.Thread(target=self.reminder_scheduler, daemon=True).start()
         # Optional read-only state server so a remote mirror (e.g. a Pi e-ink
         # display) can fetch what's on screen. Off unless --serve was passed.
         if getattr(self, "serve", False):

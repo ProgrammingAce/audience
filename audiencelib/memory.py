@@ -1,5 +1,5 @@
-"""Persistent short-term / long-term memory, the gold hoard, and the
-dream consolidation pass. Pure stdlib; no curses or OS-specific code.
+"""Persistent short-term / long-term memory, the gold hoard, treasure shop, and
+the dream consolidation pass. Pure stdlib; no curses or OS-specific code.
 """
 
 import datetime as dt
@@ -53,6 +53,8 @@ _MAX_MEMORY_TEXT = 500   # chars per long-term entry
 _MAX_MEMORIES = 200      # total long-term entries before writes are refused
 _SHORT_TERM_KEEP = 40    # short-term lines retained
 _RECALL_LIMIT = 10       # max matches returned by recall
+_MAX_EPISODES = 30       # live episode store cap per machine
+_EPISODE_MAX_CHARS = 200 # max chars per episode text
 
 # Confidence: how trustworthy a long-term fact is, in [0.0, 1.0]. Facts the
 # operator states directly (the Q&A path) are trusted; facts the dragon infers
@@ -90,12 +92,12 @@ _MAX_INSIGHTS_PER_REFLECT = 3
 # Hard ceiling on how many insight entries may live in the store at once. Insights
 # are reworded near-duplicates of one another by nature (see the dedup problem they
 # caused), so the category is capped tightly even though _MAX_MEMORIES is large.
-_MAX_INSIGHTS_TOTAL = 5
+_MAX_INSIGHTS_TOTAL = 3
 _INSIGHT_CATEGORY = "insight"
 # Confidence ceiling for the dragon's own deductions (source="reflected" insights).
 # Re-applied through dreams so consolidation can't inflate a reworded-dup cluster
 # into stated certainty that outranks concrete facts.
-_REFLECTED_CEILING = 0.7
+_REFLECTED_CEILING = 0.6
 # Two insights for the same subject are near-interchangeable by design, so the
 # dream's collapse loop merges them at a looser bar than the general _DUP_SIMILARITY.
 _INSIGHT_DUP_SIMILARITY = 0.35
@@ -149,7 +151,8 @@ _CONFIDENCE_WEIGHT = 0.5
 _RECENCY_WEIGHT = 0.3
 _RECENCY_HALFLIFE_DAYS = 30.0   # a fact's recency score halves every ~month
 _PIN_SCORE_BOOST = 1000.0       # dwarfs every other term so pinned sorts first
-_MEMORY_PROMPT_BUDGET = 4000    # chars of long-term memory inlined into the prompt
+_IMPORTANCE_WEIGHT = 0.4        # importance folds into ranking below relevance
+_MEMORY_PROMPT_BUDGET_TOKENS = 1000  # est. tokens of long-term memory inlined into prompt
 
 # Tiny stopword set so lexical relevance keys on content words, not glue.
 _STOPWORDS = frozenset(
@@ -163,8 +166,22 @@ _STOPWORDS = frozenset(
 # the hoard is read fresh from gold.json each turn and injected into the prompt;
 # it is NEVER written into long-term memory, so memory tools and the dream pass
 # can't touch it.
-_MAX_GOLD_DELTA = 1_000_000     # clamp a single adjustment to a sane range
+_MAX_GOLD_DELTA = 1000          # clamp a single adjustment to a sane range
 _GOLD_CATEGORY = "gold"         # legacy marker: filtered out of memory on read
+
+# Treasure shop pricing — code owns prices, the dragon owns imagination.
+_TREASURE_TIERS = {
+    "trinket": 50,
+    "gem":     250,
+    "relic":   1000,
+    "wonder":  5000,
+}
+_MAX_PURCHASES_PER_DAY = 3
+_HOARD_MOOD_FINE_HOURS = 6
+_HOARD_MOOD_PURCHASE_HOURS = 24
+_HOARD_MOOD_PROSPERING_THRESHOLD = 25
+_HOARD_MOOD_MAX_TREASURE_NAMES = 5
+_HOARD_MOOD_BLOCK_MAX_CHARS = 300
 
 # Provenance of a model call, threaded explicitly from Audience._do() through
 # ask_model to the remember tool so it can clamp confidence by source rather
@@ -178,6 +195,15 @@ def _clamp_confidence(value, default):
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, c))
+
+
+def _clamp_importance(value, default=5):
+    """Clamp importance to [1, 10]; return default when absent or invalid."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(10, v))
 
 
 def set_memory_dir(path):
@@ -259,11 +285,64 @@ def _remove_tombstones(ids):
         _rewrite_jsonl(path, kept)
 
 
+# Tombstone TTL: dead tombstones older than this are safe to drop (in days).
+# A fresh tombstone must survive long enough to reach and suppress a peer's
+# copy, so the TTL is generous.
+_TOMBSTONE_TTL_DAYS = 30
+
+
+def _compact_tombstones(previous, kept_ids, all_live_entries=None):
+    """Compact this machine's own tombstone shard after a successful dream.
+
+    Drops any tombstone whose id appears in no live shard AND is older than
+    _TOMBSTONE_TTL_DAYS days. Keeps dead-but-recent and live-referencing ones.
+    """
+    path = _tombstone_path()
+    try:
+        entries = _read_jsonl(path)
+    except Exception:
+        return
+    if not entries:
+        return
+    now = dt.datetime.now().astimezone()
+    cutoff = now - dt.timedelta(days=_TOMBSTONE_TTL_DAYS)
+    cutoff_str = cutoff.isoformat(timespec="seconds")
+    # All ids that are still alive across every shard.
+    if all_live_entries:
+        live_ids = {e["id"] for e in all_live_entries if isinstance(e, dict) and e.get("id")}
+    else:
+        live_ids = set()
+    # Also check previous for any id the dream kept verbatim (still alive).
+    for m in previous:
+        mid = m.get("id")
+        if mid:
+            live_ids.add(mid)
+    kept = []
+    for t in entries:
+        tid = t.get("id")
+        if tid in live_ids:
+            kept.append(t)
+            continue
+        ts = t.get("ts", "")
+        # Keep tombstones that are recent (peer might not have synced yet).
+        if ts > cutoff_str:
+            kept.append(t)
+            continue
+        # Dead + old: safe to drop.
+    if len(kept) != len(entries):
+        _rewrite_jsonl(path, kept)
+
+
 def read_long_term():
     """All live long-term memories: union of every shard, minus tombstones.
 
     Deduplicated by id (content hash), so the same fact written on two machines
     collapses to one entry. Ordered oldest-first by timestamp for stability.
+    When the same id appears in multiple shards the first copy wins, but pin
+    state and last_confirmed are OR'd/max'd across copies so a local shadow
+    reliably surfaces. After id-union, same-subject near-dups are collapsed at
+    read-time (preferred: pinned > confidence > longer text) to handle
+    cross-machine dream divergence.
     """
     suppressed = _read_tombstones()
     by_id = {}
@@ -273,14 +352,50 @@ def read_long_term():
             if not mid or mid in suppressed:
                 continue
             if mid in by_id:
-                # Same fact on another machine: keep the first copy, but let a pin
-                # on any shard win so a /pin written as a local shadow reliably
-                # sticks regardless of which shard read first.
+                existing = by_id[mid]
+                # Let a pin on any shard win.
                 if m.get("pinned"):
-                    by_id[mid]["pinned"] = True
+                    existing["pinned"] = True
+                # Keep the freshest last_confirmed across copies.
+                incoming_lc = m.get("last_confirmed")
+                existing_lc = existing.get("last_confirmed")
+                if incoming_lc and (not existing_lc or incoming_lc > existing_lc):
+                    existing["last_confirmed"] = incoming_lc
                 continue
             by_id[mid] = dict(m)
-    return sorted(by_id.values(), key=lambda m: m.get("ts") or "")
+    entries = list(by_id.values())
+
+    # Read-time collapse of same-subject near-dups (cross-machine dream
+    # divergence). Prefer pinned > confidence > longer text, matching
+    # apply_dream's preference order.
+    by_subject = {}
+    for e in entries:
+        subj = e.get("subject", _SUBJECT_OPERATOR)
+        by_subject.setdefault(subj, []).append(e)
+    collapsed = []
+    for subj, items in by_subject.items():
+        if len(items) <= 1:
+            collapsed.extend(items)
+            continue
+        kept = []
+        for item in items:
+            winner = None
+            for i, k in enumerate(kept):
+                if _text_similarity(item.get("text", ""),
+                                    k.get("text", "")) >= _DUP_SIMILARITY:
+                    # Pinned wins; otherwise higher confidence wins; then longer.
+                    if (bool(item.get("pinned")),
+                            item.get("confidence", 0),
+                            len(item.get("text", ""))) > \
+                            (bool(k.get("pinned")),
+                             k.get("confidence", 0),
+                             len(k.get("text", ""))):
+                        kept[i] = item
+                    break  # no twin for this new item
+            else:
+                kept.append(item)
+        collapsed.extend(kept)
+    return sorted(collapsed, key=lambda m: m.get("ts") or "")
 
 
 def read_short_term():
@@ -364,7 +479,14 @@ def tool_remember(text="", category=None, confidence=None, source=None,
     a fact about the dragon's own name is never confused with the operator's. The
     id folds the subject in, so the same text about each is two distinct entries.
     Confidence is clamped by the call's `source` (see _resolve_confidence), which
-    the dispatcher injects — it is not model-controlled.
+    the dispatcher injects — it is not model-controlled. `source` is also stored
+    so later passes can distinguish operator-stated facts from screen-inferred ones.
+
+    When a near-duplicate exists and source is "stated", the old entry is
+    tombstoned and the new text supersedes it (carrying over first_seen and
+    pinned state). This lets the operator correct facts without fighting the
+    similarity gate. For inferred near-dups the refusal carries a
+    ``corroborated`` id so the caller can incrementally reinforce the twin.
     """
     text = (text or "").strip()
     if not text:
@@ -379,16 +501,47 @@ def tool_remember(text="", category=None, confidence=None, source=None,
                and _normalize_subject(m.get("subject")) == subject
                for m in memories):
             return {"success": False, "error": "already remembered"}
-        # Also refuse near-duplicates: a fact too similar to one already held
-        # (same subject) adds no signal and only grows a cluster the dream would
-        # later have to collapse. Catch it at the door instead.
+        # List-rejection guard: screen-inferred facts with 4+ comma-separated
+        # items are laundry lists of consumed content, not single claims.
+        if source == "inferred" and _is_laundry_list(text):
+            return {"success": False,
+                    "error": ("too many items — save the single strongest claim, "
+                              "not a list")
+                    }
+        # Also handle near-duplicates: supersede on stated correction,
+        # refuse with corroboration hint on inferred re-evidence.
         sim, twin = _most_similar(text, subject, memories)
         if sim >= _DUP_SIMILARITY:
-            return {"success": False,
-                    "error": ("already know something too similar: "
-                              f"\"{twin.get('text')}\""),
-                    "similar_to": twin.get("id"),
-                    "similarity": round(sim, 2)}
+            twin_pinned = twin.get("pinned")
+            twin_source = twin.get("source")
+            twin_text = twin.get("text", "")
+            twin_confirmed = twin.get("last_confirmed")
+            # Pinned twins resist correction from screens.
+            if twin_pinned and source != "stated":
+                return {"success": False,
+                        "error": ("already know something too similar: "
+                                  f"\"{twin_text}\""),
+                        "similar_to": twin.get("id"),
+                        "similarity": round(sim, 2)}
+            # Stated corrections supersede the old entry.
+            if source == "stated" and text != twin_text:
+                _add_tombstones({twin.get("id")})
+                # Carry over first_seen and pinned state.
+                first_seen = twin.get("first_seen")
+                inherit_pin = bool(twin_pinned)
+                # Also re-check pin if stated + identity category.
+                if source == "stated" and category == _PIN_CATEGORY:
+                    inherit_pin = True
+            else:
+                # Inferred near-dup: refuse but bump last_confirmed so the
+                # twin's recency is reinforced (corroboration by re-evidence).
+                _bump_last_confirmed_safe(twin.get("id"))
+                return {"success": False,
+                        "error": ("already know something too similar: "
+                                  f"\"{twin_text}\""),
+                        "similar_to": twin.get("id"),
+                        "similarity": round(sim, 2),
+                        "corroborated": twin.get("id")}
         if len(memories) >= _MAX_MEMORIES:
             return {"success": False,
                     "error": "memory is full; forget something first"}
@@ -397,6 +550,33 @@ def tool_remember(text="", category=None, confidence=None, source=None,
         # leaving the re-remember masked by the old suppression.
         _remove_tombstones({mem_id})
         now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        superseded = None
+        if sim >= _DUP_SIMILARITY and source == "stated" and text != twin_text:
+            superseded = twin.get("id")
+            first_seen = twin.get("first_seen")
+            inherit_pin = bool(twin.get("pinned")) or \
+                (source == "stated" and category == _PIN_CATEGORY)
+            inherit_importance = twin.get("importance")
+            pinned = inherit_pin
+            entry = {
+                "id": mem_id,
+                "ts": now,
+                "first_seen": first_seen,
+                "category": (category or None),
+                "subject": subject,
+                "text": text,
+                "confidence": round(conf, 2),
+            }
+            if source:
+                entry["source"] = source
+            if inherit_importance is not None:
+                entry["importance"] = inherit_importance
+            if inherit_pin:
+                entry["pinned"] = True
+            _append_jsonl(_long_term_path(), entry)
+            return {"success": True, "id": mem_id, "confidence": round(conf, 2),
+                    "pinned": pinned, "subject": subject,
+                    "superseded": superseded}
         # A fact the operator states about who's who — their name, the dragon's
         # name — is an absolute: pin it so no dream can ever age it out.
         pinned = (source == "stated" and category == _PIN_CATEGORY)
@@ -409,6 +589,8 @@ def tool_remember(text="", category=None, confidence=None, source=None,
             "text": text,
             "confidence": round(conf, 2),
         }
+        if source:
+            entry["source"] = source
         if pinned:
             entry["pinned"] = True
         _append_jsonl(_long_term_path(), entry)
@@ -416,6 +598,11 @@ def tool_remember(text="", category=None, confidence=None, source=None,
                 "pinned": pinned, "subject": subject}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _estimate_tokens(text):
+    """Rough token count for *text*: ~4 chars per token, minimum 1."""
+    return max(1, len(text) // 4)
 
 
 def _tokenize(text):
@@ -435,6 +622,11 @@ def _tokenize(text):
 # as similar here — the ≥2-token guard in _text_similarity and subject-scoping
 # limit the blast radius, but that's the inherent ceiling of token overlap.
 _DUP_SIMILARITY = 0.5
+
+# Heuristic threshold for the list-rejection guard in tool_remember: if a
+# screen-inferred fact splits into ≥4 comma-separated items it is likely a
+# laundry-list of consumed content, not a single claim.
+_LIST_ITEM_THRESHOLD = 4
 
 
 def _text_similarity(a, b):
@@ -470,9 +662,34 @@ def _most_similar(text, subject, memories):
     return best_sim, best
 
 
+# Threshold for detecting duplicate commentary in the short-term log.
+_COMMENTARY_DUP_SIMILARITY = 0.8
+
+
+def _is_commentary_dup(answer, short_term):
+    """Check if *answer* duplicates any of the last ~10 Dragon lines.
+
+    Returns True when the answer is too similar to a recent dragon remark,
+    suggesting the model would repeat itself on an unchanged screen.
+    """
+    if not short_term:
+        return False
+    dragon_lines = [e.get("text", "") for e in short_term[-10:]
+                    if (e.get("label", "") or "").lower() == "dragon"]
+    for line in dragon_lines:
+        if _text_similarity(answer, line) >= _COMMENTARY_DUP_SIMILARITY:
+            return True
+    return False
+
+
+def _is_laundry_list(text):
+    """True if text looks like a list of 4+ comma-separated items."""
+    return len(text.split(",")) >= _LIST_ITEM_THRESHOLD
+
+
 def _age_days(entry, now):
     """Whole days since the fact was first learned (or last stamped). 0 on error."""
-    stamp = entry.get("first_seen") or entry.get("ts")
+    stamp = entry.get("last_confirmed") or entry.get("first_seen") or entry.get("ts")
     if not stamp:
         return 0.0
     try:
@@ -485,12 +702,15 @@ def _age_days(entry, now):
 
 
 def _score_memory(entry, query_tokens, now):
-    """Rank a memory for retrieval: relevance + confidence + recency, pinned first.
+    """Rank a memory for retrieval: relevance + importance + confidence + recency,
+    pinned first.
 
-    `query_tokens` is the tokenized query (empty set ⇒ no relevance term, so the
-    ranking falls back to confidence and recency — used by the query-less prompt
-    path). Recency decays on a half-life so an old fact fades but never goes
-    negative; a pinned absolute gets a boost that dwarfs every other term.
+    `query_tokens` is the tokenized query (empty set => no relevance term, so the
+    ranking falls back to importance, confidence, and recency — used by the
+    query-less prompt path). Recency decays on a half-life so an old fact fades
+    but never goes negative; a pinned absolute gets a boost that dwarfs every
+    other term. Importance measures how much the fact matters for being a good
+    long-term companion (1-10).
     """
     score = 0.0
     if query_tokens:
@@ -499,6 +719,8 @@ def _score_memory(entry, query_tokens, now):
         if fact_tokens:
             overlap = len(query_tokens & fact_tokens) / len(query_tokens)
             score += _RELEVANCE_WEIGHT * overlap
+    score += _IMPORTANCE_WEIGHT * (_clamp_importance(
+        entry.get("importance"), 5) / 10.0)
     score += _CONFIDENCE_WEIGHT * _clamp_confidence(entry.get("confidence"),
                                                     _DEFAULT_CONFIDENCE)
     recency = 0.5 ** (_age_days(entry, now) / _RECENCY_HALFLIFE_DAYS)
@@ -553,6 +775,11 @@ def tool_recall(query="", subject=None, **_):
                    or query in (m.get("text") or "").lower()
                    or query in (m.get("category") or "").lower()]
     matches = rank_memories(matches, query=query, limit=_RECALL_LIMIT)
+    # Retrieval with use: bump last_confirmed for all returned matches so
+    # facts the model actually consults get a recency boost.
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    for m in matches:
+        _bump_last_confirmed(m.get("id"), now)
     return {
         "success": True,
         "matches": [{"id": m.get("id"), "category": m.get("category"),
@@ -671,12 +898,13 @@ def _gold_ledger_path():
 
 
 def _read_gold():
-    """Current hoard total as an int: the legacy base plus every shard's deltas.
+    """Current hoard total as an int: legacy base + gold deltas − treasure costs.
 
     The hoard is an append-only ledger of signed deltas, one shard per machine,
     so two machines awarding/docking gold at once both persist and the sum is
     correct. A legacy single-value gold.json (from before sharding) is folded in
-    as a starting base.
+    as a starting base. Treasure purchases are stored in a separate shard and
+    subtracted here so the total reflects what the dragon can actually spend.
     """
     total = 0
     try:
@@ -690,17 +918,28 @@ def _read_gold():
                 total += int(entry.get("delta", 0))
             except (TypeError, ValueError):
                 continue
+    for path in _shard_glob("treasures"):
+        for entry in _read_jsonl(path):
+            try:
+                total -= int(entry.get("cost", 0))
+            except (TypeError, ValueError):
+                continue
     return total
 
 
-def tool_adjust_gold(amount=0, reason="", **_):
-    """Add (reward) or subtract (punishment) gold from the hoard. Deterministic."""
+def tool_adjust_gold(amount=0, reason="", source="model", **_):
+    """Add (reward) or subtract (punishment) gold from the hoard. Deterministic.
+
+    ``source`` records provenance: "model" (default going forward), "operator"
+    (from /gold commands), or None (legacy).
+    """
     try:
         delta = int(amount)
     except (TypeError, ValueError):
         return {"success": False, "error": "amount must be a whole number"}
     if delta == 0:
         return {"success": False, "error": "amount must be non-zero"}
+    clamped = delta != 0 and abs(delta) > _MAX_GOLD_DELTA
     delta = max(-_MAX_GOLD_DELTA, min(_MAX_GOLD_DELTA, delta))
     before = _read_gold()
     try:
@@ -710,16 +949,308 @@ def tool_adjust_gold(amount=0, reason="", **_):
             "delta": delta,
             "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "reason": (reason or "").strip() or None,
+            "source": source,
         })
     except Exception as e:
         return {"success": False, "error": str(e)}
-    return {"success": True, "change": delta, "previous": before,
-            "total": before + delta, "reason": (reason or "").strip() or None}
+    result = {"success": True, "change": delta, "previous": before,
+              "total": before + delta, "reason": (reason or "").strip() or None}
+    if clamped:
+        result["clamped"] = True
+    return result
 
 
 def tool_gold_total(**_):
     """Report the current gold hoard total."""
     return {"success": True, "total": _read_gold()}
+
+
+# --------------------------------------------------------------------------
+# Treasure shop — buy_treasure, list_treasures, gold_history
+# --------------------------------------------------------------------------
+
+
+def _treasure_ledger_path():
+    return _shard_path("treasures")
+
+
+def _humanize_age(ts, now=None, compact=False):
+    """Humanize an ISO 8601 timestamp to a relative age string.
+
+    ``compact=True`` returns e.g. "2h", "1d", "30m", "5d".
+    ``compact=False`` returns e.g. "2 hours ago", "1 day ago", "30 minutes ago", "5 days ago".
+    """
+    if now is None:
+        now = dt.datetime.now().astimezone()
+    try:
+        ts_dt = dt.datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return "unknown" if compact else "unknown"
+    try:
+        delta = now - ts_dt
+    except (TypeError, ValueError):
+        return "unknown" if compact else "unknown"
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 0:
+        return "future" if compact else "in the future"
+    if total_seconds < 60:
+        if compact:
+            return f"{total_seconds}s"
+        if total_seconds < 2:
+            return "just now"
+        return f"{total_seconds} seconds ago"
+    minutes = total_seconds // 60
+    if minutes < 60:
+        if compact:
+            return f"{minutes}m"
+        return f"{minutes} minutes ago" if minutes != 1 else "1 minute ago"
+    hours = minutes // 60
+    if hours < 24:
+        if compact:
+            return f"{hours}h"
+        return f"{hours} hours ago" if hours != 1 else "1 hour ago"
+    days = hours // 24
+    if days < 365:
+        if compact:
+            return f"{days}d"
+        return f"{days} days ago" if days != 1 else "1 day ago"
+    years = days // 365
+    if compact:
+        return f"{years}y"
+    return f"{years} years ago" if years != 1 else "1 year ago"
+
+
+def _today_shard_date():
+    """Today's date in local time for purchase-cap counting."""
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def _count_purchases_today():
+    """Count treasure purchases made today on this host's shard."""
+    today = _today_shard_date()
+    count = 0
+    try:
+        for entry in _read_jsonl(_treasure_ledger_path()):
+            ts = entry.get("ts", "")
+            if ts.startswith(today):
+                count += 1
+    except FileNotFoundError:
+        pass
+    return count
+
+
+def _parse_now(compact=False):
+    """Return current local datetime and ISO timestamp."""
+    now = dt.datetime.now().astimezone()
+    return now, now.isoformat(timespec="seconds")
+
+
+def hoard_mood(now=None):
+    """Return (mood_key, phrase) derived from gold + treasure ledgers.
+
+    Precedence — first match wins:
+      indebted   total < 0
+      stung      fine within last _HOARD_MOOD_FINE_HOURS
+      delighted  purchase within last _HOARD_MOOD_PURCHASE_HOURS
+      prospering 24h net gold delta >= _HOARD_MOOD_PROSPERING_THRESHOLD
+      content    otherwise (phrase is None)
+    """
+    if now is None:
+        now, _ = _parse_now()
+    total = _read_gold()
+    if total < 0:
+        return ("indebted", "your hoard is in debt — wounded pride")
+    # Check for recent fine.
+    cutoff_fine = now - dt.timedelta(hours=_HOARD_MOOD_FINE_HOURS)
+    for path in _shard_glob("gold"):
+        for entry in _read_jsonl(path):
+            delta = entry.get("delta")
+            if isinstance(delta, str):
+                try:
+                    delta = int(delta)
+                except (TypeError, ValueError):
+                    continue
+            if delta is None:
+                continue
+            try:
+                delta = int(delta)
+            except (TypeError, ValueError):
+                continue
+            if delta < 0:
+                try:
+                    ts = dt.datetime.fromisoformat(entry["ts"])
+                    if ts >= cutoff_fine:
+                        return ("stung", "you were fined recently and it smarts")
+                except (KeyError, ValueError, TypeError):
+                    continue
+    # Check for recent purchase.
+    cutoff_purchase = now - dt.timedelta(hours=_HOARD_MOOD_PURCHASE_HOURS)
+    for path in _shard_glob("treasures"):
+        for entry in _read_jsonl(path):
+            try:
+                ts = dt.datetime.fromisoformat(entry["ts"])
+                if ts >= cutoff_purchase:
+                    name = entry.get("name", "a treasure")
+                    return ("delighted", f"you bought {name} today and adore it")
+            except (KeyError, ValueError, TypeError):
+                continue
+    # Check 24h net gold delta.
+    cutoff_delta = now - dt.timedelta(hours=24)
+    net_24h = 0
+    for path in _shard_glob("gold"):
+        for entry in _read_jsonl(path):
+            delta = entry.get("delta")
+            if isinstance(delta, str):
+                try:
+                    delta = int(delta)
+                except (TypeError, ValueError):
+                    continue
+            if delta is None:
+                continue
+            try:
+                delta = int(delta)
+            except (TypeError, ValueError):
+                continue
+            try:
+                ts = dt.datetime.fromisoformat(entry["ts"])
+                if ts >= cutoff_delta:
+                    net_24h += delta
+            except (KeyError, ValueError, TypeError):
+                continue
+    if net_24h >= _HOARD_MOOD_PROSPERING_THRESHOLD:
+        return ("prospering", "your hoard grew today")
+    return ("content", None)
+
+
+def _collect_treasures_sorted():
+    """Union all treasure shards, newest first."""
+    all_items = []
+    for path in _shard_glob("treasures"):
+        for entry in _read_jsonl(path):
+            all_items.append(entry)
+    all_items.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return all_items
+
+
+def _collect_all_events(limit=10):
+    """Merge gold deltas and purchases into a single newest-first list, capped.
+
+    Returns up to ``limit`` events, each:
+      {"type": "adjustment"|"purchase", "delta": int|None, "ts": str,
+       "reason": str|None, "name": str|None, "cost": int|None, "source": str|None}
+    """
+    events = []
+    for path in _shard_glob("gold"):
+        for entry in _read_jsonl(path):
+            delta = entry.get("delta")
+            if isinstance(delta, str):
+                try:
+                    delta = int(delta)
+                except (TypeError, ValueError):
+                    continue
+            if delta is None:
+                continue
+            try:
+                delta = int(delta)
+            except (TypeError, ValueError):
+                continue
+            source = entry.get("source")
+            if source is None:
+                source = "unknown"
+            events.append({
+                "type": "adjustment",
+                "delta": delta,
+                "ts": entry.get("ts", ""),
+                "reason": entry.get("reason"),
+                "name": None,
+                "cost": None,
+                "source": source,
+            })
+    for path in _shard_glob("treasures"):
+        for entry in _read_jsonl(path):
+            events.append({
+                "type": "purchase",
+                "delta": -entry.get("cost", 0),
+                "ts": entry.get("ts", ""),
+                "reason": f"bought: {entry.get('name', '?')}",
+                "name": entry.get("name"),
+                "cost": entry.get("cost"),
+                "source": entry.get("source", "unknown"),
+            })
+    events.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return events[:limit]
+
+
+def tool_buy_treasure(name, tier, desc="", **_):
+    """Purchase a treasure from your hoard.
+
+    The dragon invents the item; code owns the tier price.
+    ``name`` ≤ 60 chars, ``desc`` ≤ 200 chars, ``tier`` must be known.
+    Fails if hoard is insufficient or daily cap reached.
+    """
+    if not name or not name.strip():
+        return {"success": False, "error": "name is required"}
+    name = name.strip()[:60]
+    if desc:
+        desc = desc.strip()[:200]
+    tier = (tier or "").strip()
+    if tier not in _TREASURE_TIERS:
+        return {"success": False, "error": f"unknown tier: {tier or '(empty)'} — must be one of {', '.join(sorted(_TREASURE_TIERS))}"}
+    cost = _TREASURE_TIERS[tier]
+    total = _read_gold()
+    if total < cost:
+        shortfall = cost - total
+        return {"success": False, "error": f"insufficient funds: you have {total} gold, need {cost} ({shortfall} short)"}
+    today_count = _count_purchases_today()
+    if today_count >= _MAX_PURCHASES_PER_DAY:
+        return {"success": False, "error": "purchase cap reached — only 3 per day per host"}
+    now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    raw = f"{name}|{now_iso}|{_machine_id()}"
+    tid = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    try:
+        _append_jsonl(_treasure_ledger_path(), {
+            "id": tid,
+            "name": name,
+            "tier": tier,
+            "cost": cost,
+            "desc": (desc or "").strip() or None,
+            "ts": now_iso,
+        })
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "name": name, "tier": tier, "cost": cost,
+            "remaining": total - cost}
+
+
+def tool_list_treasures(**_):
+    """List all treasures you own, newest first, with total collection value."""
+    treasures = _collect_treasures_sorted()
+    total_value = sum(t.get("cost", 0) for t in treasures)
+    items = [{"name": t.get("name", "?"), "tier": t.get("tier", "?"),
+              "desc": t.get("desc"), "ts": t.get("ts", ""), "cost": t.get("cost", 0)}
+             for t in treasures]
+    return {"success": True, "treasures": items, "count": len(items), "total_value": total_value}
+
+
+def tool_gold_history(limit=10, **_):
+    """Return recent gold ledger events plus the current total.
+
+    ``limit`` is clamped to 1–25. Events include both adjustments and purchases.
+    """
+    limit = max(1, min(25, limit))
+    total = _read_gold()
+    raw_events = _collect_all_events(limit=limit)
+    now, _ = _parse_now()
+    events = []
+    for e in raw_events:
+        kind = "purchase" if e["type"] == "purchase" else "adjustment"
+        events.append({
+            "delta": e["delta"],
+            "when": _humanize_age(e["ts"], now=now, compact=False),
+            "reason": e["reason"] or "(no reason)",
+            "kind": kind,
+        })
+    return {"total": total, "events": events}
 
 
 def record_short_term(label, text):
@@ -742,14 +1273,15 @@ def record_short_term(label, text):
 
 
 def _parse_dream(raw):
-    """Pull the {"memories": [...]} object out of the model's dream response.
+    """Pull the {"memories": [...]} and optional {"episode": str|null} from the
+    model's dream response.
 
     Tolerates code fences and surrounding prose by extracting the outermost
-    JSON object. Returns the memories list, or None if nothing valid is found —
-    the caller leaves memory untouched on None, so a bad dream never deletes.
+    JSON object. Returns (memories, episode) where memories is the list and
+    episode is a string or None. Returns (None, None) on parse failure.
     """
     if not raw:
-        return None
+        return None, None
     text = raw.strip()
     if text.startswith("```"):
         # strip a ```json … ``` fence if the model added one
@@ -757,6 +1289,22 @@ def _parse_dream(raw):
         if text.lower().startswith("json"):
             text = text[4:]
     start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None, None
+    try:
+        obj = json.loads(text[start:end + 1])
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(obj, dict):
+        return None, None
+    mems = obj.get("memories")
+    if not isinstance(mems, list):
+        return None, None
+    episode = obj.get("episode")
+    # episode may be str|null; coerce None for absent field.
+    if episode is not None and not isinstance(episode, str):
+        episode = None
+    return mems, episode
     if start == -1 or end == -1 or end <= start:
         return None
     try:
@@ -771,6 +1319,40 @@ def _parse_dream(raw):
     return mems
 
 
+def _bump_last_confirmed_safe(mem_id):
+    """Bump last_confirmed for *mem_id* on this machine's shard if >24h ago."""
+    try:
+        _bump_last_confirmed(mem_id)
+    except Exception:
+        pass
+
+
+def _bump_last_confirmed(mem_id, now=None):
+    """Rewrite this machine's shard to set/advance last_confirmed for *mem_id*.
+
+    Only proceeds if the entry hasn't been confirmed today (rate limit).
+    If the id lives only in a peer's shard this is a no-op (the write
+    target is this machine's own shard).
+    """
+    if now is None:
+        now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    today = now[:10]  # YYYY-MM-DD
+    path = _long_term_path()
+    entries = _read_jsonl(path)
+    updated = False
+    for e in entries:
+        if e.get("id") == mem_id:
+            existing = e.get("last_confirmed", "")
+            # Rate limit: once per day.
+            if existing and existing[:10] == today:
+                return
+            e["last_confirmed"] = now
+            updated = True
+            break
+    if updated:
+        _rewrite_jsonl(path, entries)
+
+
 def apply_dream(raw):
     """Validate a dream response and rewrite long-term memory from it.
 
@@ -778,7 +1360,7 @@ def apply_dream(raw):
     untouched. On success backs up the prior store to long_term.bak.jsonl, writes
     the consolidated set, trims short-term, and returns (True, new_count).
     """
-    mems = _parse_dream(raw)
+    mems, episode = _parse_dream(raw)
     if mems is None:
         return False, "unparseable dream"
 
@@ -821,6 +1403,17 @@ def apply_dream(raw):
         first_seen = (prior or {}).get("first_seen") or ts
         category = (m.get("category") or None)
         conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
+        # Carry prior provenance through so a dream can't launder an inferred
+        # fact into stated certainty. A dream may lower confidence but may never
+        # raise a non-stated fact above its source cap. For brand-new merged text
+        # (no matching prior at all) accept the model's claim; mark provenance
+        # as "inferred" for storage purposes but don't clamp.
+        if prior is not None:
+            provenance = prior.get("source")  # may be None
+            if provenance is not None and provenance != "stated":
+                conf = _resolve_confidence(conf, provenance)
+        else:
+            provenance = "inferred"
         # An insight is the dragon's own deduction, not a stated fact. The dream
         # must not inflate it: a cluster of reworded near-dups reads as mutual
         # corroboration and would otherwise be pushed to certainty that outranks
@@ -837,6 +1430,13 @@ def apply_dream(raw):
             "text": text,
             "confidence": round(conf, 2),
         }
+        if provenance is not None:
+            entry["source"] = provenance
+        # Carry importance through from prior; for new/merged text default 5.
+        if prior and prior.get("importance") is not None:
+            entry["importance"] = prior["importance"]
+        elif "importance" not in entry:
+            entry["importance"] = 5
         # A pin survives the dream no matter what the model said: if it was pinned
         # before, it stays pinned (and keeps its full prior confidence).
         if prior and prior.get("pinned"):
@@ -917,6 +1517,19 @@ def apply_dream(raw):
             _rewrite_jsonl(_short_term_path(), short[-_SHORT_TERM_AFTER_DREAM:])
     except Exception as e:
         return False, str(e)
+
+    # Store the episodic summary if the model provided one.
+    if episode:
+        try:
+            store_episode(episode)
+        except Exception:
+            pass  # episodes are best-effort; never break the dream.
+
+    # Tombstone hygiene: compact this machine's own tombstone shard — drop
+    # dead+old tombstones (≥30 days past TTL) whose ids no longer exist in any
+    # live shard. Never touch a peer's tombstone shard.
+    _compact_tombstones(previous, refined_ids, refined)
+
     return True, len(refined)
 
 
@@ -978,3 +1591,220 @@ def add_insights(insights):
         insight_count += 1
         added += 1
     return added
+
+
+# --- Episodic session summaries (tier-3 memory) --------------------------------
+
+def _episode_path():
+    """This machine's own episode shard."""
+    return _shard_path("episodes")
+
+
+def _read_episodes():
+    """All episodes across shards, ordered oldest-first."""
+    entries = []
+    for path in _shard_glob("episodes"):
+        entries.extend(_read_jsonl(path))
+    return sorted(entries, key=lambda e: e.get("ts", ""))
+
+
+def store_episode(text, date_str=None):
+    """Store one episode summary (≤200 chars), trimming oldest if over cap."""
+    text = (text or "").strip()
+    if not text:
+        return
+    if len(text) > _EPISODE_MAX_CHARS:
+        text = text[:_EPISODE_MAX_CHARS]
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    if not date_str:
+        try:
+            date_str = now[:10]
+        except (IndexError, TypeError):
+            date_str = "unknown"
+    _append_jsonl(_episode_path(), {
+        "ts": now,
+        "date": date_str,
+        "text": text,
+    })
+    # Trim this machine's own shard to _MAX_EPISODES.
+    entries = _read_jsonl(_episode_path())
+    if len(entries) > _MAX_EPISODES:
+        _rewrite_jsonl(_episode_path(),
+                       entries[-_MAX_EPISODES:])
+
+
+def read_episodes():
+    """Last N episodes across all shards, newest-first, capped to 5."""
+    episodes = _read_episodes()
+    return list(reversed(episodes))[:5]
+
+
+# --------------------------------------------------------------------------
+# Scheduled reminders — host-sharded append-only ledger
+# --------------------------------------------------------------------------
+#
+# Each machine owns its own shard: reminders.<host>.jsonl.  Firing or cancelling
+# *appends* a {"id": ..., "status": "fired"|"cancelled"} record; the effective
+# state is the last record per id.  This mirrors the tombstone pattern so a
+# synced --memory-dir never produces write conflicts.
+
+_MAX_REMINDER_TEXT = 300
+
+
+def _reminder_path():
+    """This machine's own reminder shard."""
+    return _shard_path("reminders")
+
+
+def _read_reminders():
+    """All reminder records across shards, ordered oldest-first."""
+    entries = []
+    for path in _shard_glob("reminders"):
+        entries.extend(_read_jsonl(path))
+    return sorted(entries, key=lambda e: e.get("ts") or "")
+
+
+def effective_reminders():
+    """Effective state per reminder id (last record wins)."""
+    by_id = {}
+    for r in _read_reminders():
+        rid = r.get("id")
+        if rid:
+            by_id[rid] = r
+    return by_id
+
+
+def tool_set_reminder(text="", due_iso="", **_):
+    """Schedule a reminder for a future absolute ISO time.
+
+    The model computes the absolute time itself (it has the `now` tool and
+    the timestamp in context).  We validate that *due_iso* parses and is in
+    the future, cap *text* at 300 chars, and generate a stable id from the
+    content (text + due).
+
+    Returns {"id": ..., "due_human": ...} on success, or an error dict.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"error": "nothing to remind about (empty text)"}
+    if len(text) > _MAX_REMINDER_TEXT:
+        text = text[:_MAX_REMINDER_TEXT]
+    due_iso = (due_iso or "").strip()
+    if not due_iso:
+        return {"error": "due time is required (ISO 8601)"}
+    try:
+        due_dt = dt.datetime.fromisoformat(due_iso)
+    except (ValueError, TypeError):
+        return {"error": f"cannot parse due time: {due_iso}"}
+    now = dt.datetime.now().astimezone()
+    if due_dt <= now:
+        return {"error": "due time must be in the future"}
+    # Stable id from content hash of text + due.
+    raw = f"{text}\x00{due_iso}"
+    rid = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    now_iso = now.isoformat(timespec="seconds")
+    due_human = due_dt.strftime("%A %Y-%m-%d %H:%M:%S %Z")
+    # Reject duplicate: if this exact content already exists as pending, refuse.
+    by_id = effective_reminders()
+    if rid in by_id and by_id[rid].get("status") == "pending":
+        return {"error": "reminder already set"}
+    try:
+        _append_jsonl(_reminder_path(), {
+            "id": rid,
+            "text": text,
+            "due": due_iso,
+            "due_dt": due_dt.isoformat(timespec="seconds"),
+            "created": now_iso,
+            "status": "pending",
+        })
+        return {"id": rid, "due_human": due_human, "text": text}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_list_reminders(**_):
+    """List pending reminders across all shards with ids, due times, and origin host."""
+    pending = []
+    for r in _read_reminders():
+        status = r.get("status", "pending")
+        # Last-record-wins: only report if this is the active record.
+        rid = r.get("id")
+        if not rid:
+            continue
+        by_id = effective_reminders()
+        active = by_id.get(rid)
+        if active and active.get("status") == "pending":
+            host = "unknown"
+            for p in _shard_glob("reminders"):
+                try:
+                    basename = os.path.basename(p)
+                    # Format: reminders.<host>.jsonl
+                    parts = basename.split(".")
+                    if len(parts) >= 3 and parts[0] == "reminders" and parts[-1] == "jsonl":
+                        host = ".".join(parts[1:-1])
+                        break
+                except Exception:
+                    pass
+            pending.append({
+                "id": rid,
+                "text": r.get("text", ""),
+                "due": r.get("due", ""),
+                "host": host,
+            })
+    # Dedup by id (same reminder may appear from multiple shards).
+    seen = set()
+    deduped = []
+    for r in pending:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            deduped.append(r)
+    return {"reminders": deduped}
+
+
+def tool_cancel_reminder(id="", **_):
+    """Cancel a pending reminder by id. Only pending reminders are cancellable."""
+    rid = (id or "").strip()
+    if not rid:
+        return {"error": "reminder id is required"}
+    by_id = effective_reminders()
+    active = by_id.get(rid)
+    if not active or active.get("status", "pending") != "pending":
+        return {"error": "reminder is not pending"}
+    try:
+        _append_jsonl(_reminder_path(), {
+            "id": rid,
+            "status": "cancelled",
+            "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        })
+        return {"success": True, "id": rid}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def scan_stale_reminders():
+    """Fire pending reminders whose due time passed while the app was closed.
+
+    Only reminders ≤24h stale are delivered; older ones are silently marked fired.
+    Returns list of (reminder_text,) for reminders that should fire.
+    """
+    now = dt.datetime.now().astimezone()
+    stale_cutoff = now - dt.timedelta(hours=24)
+    to_fire = []
+    by_id = effective_reminders()
+    pending = {rid: r for rid, r in by_id.items() if r.get("status") == "pending"}
+    for rid, r in pending.items():
+        try:
+            due_dt = dt.datetime.fromisoformat(r.get("due_dt", "") or r.get("due", ""))
+        except (ValueError, TypeError):
+            continue
+        if due_dt <= now:
+            if due_dt < stale_cutoff:
+                # >24h stale: mark fired without delivery.
+                _append_jsonl(_reminder_path(), {
+                    "id": rid,
+                    "status": "fired",
+                    "ts": now.isoformat(timespec="seconds"),
+                })
+            else:
+                to_fire.append(r.get("text", ""))
+    return to_fire

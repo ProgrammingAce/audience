@@ -8,10 +8,14 @@ the working-directory-confined file tools and wires every tool
 import base64
 import json
 import os
+import subprocess
 
 from .memory import (
     tool_remember, tool_recall, tool_forget,
     tool_adjust_gold, tool_gold_total,
+    tool_buy_treasure, tool_list_treasures, tool_gold_history,
+    tool_set_reminder, tool_list_reminders, tool_cancel_reminder,
+    scan_stale_reminders,
 )
 
 # --------------------------------------------------------------------------
@@ -104,6 +108,165 @@ def tool_read_file(path, **_):
         return {"success": False, "error": str(e)}
 
 
+_LIST_FILE_CAP = 200
+
+
+def tool_list_files(path=".", **_):
+    """List entries in a directory under the working directory.
+
+    Non-recursive, one level per call.  Entries are sorted with directories
+    first, then by name within each group.  At most ``_LIST_FILE_CAP`` entries
+    are returned; when the directory is larger a ``{"truncated": true,
+    "total": n}`` marker is appended.  Per-entry fields are ``{"name": ...,
+    "type": "dir"|"file", "size": bytes or null}`` (size for files only).
+    Broken entries (dangling symlinks, permissions errors) are silently
+    skipped.
+    """
+    resolved, err = _safe_path(path)
+    if err:
+        return {"error": err, "path": path}
+    try:
+        if not os.path.isdir(resolved):
+            return {"error": "not a directory", "path": path}
+        entries = []
+        try:
+            total = sum(1 for _ in os.scandir(resolved))
+        except OSError:
+            total = 0
+        dirs, files = [], []
+        for entry in os.scandir(resolved):
+            try:
+                stat = entry.stat(follow_symlinks=False)
+                entry_type = "dir" if entry.is_dir(follow_symlinks=False) else "file"
+                entry_name = entry.name
+                if entry_type == "file":
+                    files.append({"name": entry_name, "type": entry_type,
+                                  "size": stat.st_size})
+                else:
+                    dirs.append({"name": entry_name, "type": entry_type,
+                                 "size": None})
+            except OSError:
+                continue  # broken entry — silently skip
+        dirs.sort(key=lambda e: e["name"])
+        files.sort(key=lambda e: e["name"])
+        shown = dirs + files
+        if len(shown) > _LIST_FILE_CAP:
+            result = shown[:_LIST_FILE_CAP]
+            result.append({"_truncated": True, "total": total})
+            return {"path": os.path.relpath(resolved, _WORKDIR), "entries": result}
+        return {"path": os.path.relpath(resolved, _WORKDIR), "entries": shown}
+    except Exception as e:
+        return {"error": str(e), "path": path}
+
+
+def tool_git_status(**_):
+    """Read-only git snapshot of the working directory repo.
+
+    Returns branch info, ahead/behind counts, a summarized file list
+    (up to 20 paths per state), and the last commit hash.  Uses only local
+    state — never touches the network.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", _WORKDIR, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+        if result.returncode != 0 or result.stdout.strip() != "true":
+            return {"error": "the working directory is not a git repository"}
+    except FileNotFoundError:
+        return {"error": "git is not available"}
+    except (subprocess.TimeoutExpired, Exception):
+        return {"error": "git check failed"}
+
+    out = {"branch": None, "ahead": 0, "behind": 0, "changes": {}, "change_count": 0,
+           "last_commit": None}
+
+    # --- branch, ahead/behind ---
+    try:
+        result = subprocess.run(
+            ["git", "-C", _WORKDIR, "status", "--porcelain=v2", "--branch"],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+        if result.returncode == 0:
+            lines = (result.stdout[:4096] if result.stdout else "").splitlines()
+            branch = None
+            ahead = behind = 0
+            change_states = {}
+            change_paths = {}
+            for line in lines:
+                if line.startswith("# branch.head"):
+                    branch = line.split(" ", 2)[-1].strip() or None
+                elif line.startswith("# branch.oid"):
+                    pass  # skip
+                elif line.startswith("# ahead") or line.startswith("# behind"):
+                    val = line.strip().split()[-1]
+                    try:
+                        if line.startswith("# ahead"):
+                            ahead = int(val)
+                        else:
+                            behind = int(val)
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("##"):
+                    continue
+                else:
+                    # Status lines in v2 format.
+                    # Format: "<status-chars> <path-info>"
+                    # status-chars may include a stage digit prefix (1-4 for unmerged,
+                    # otherwise just <index><worktree> chars like "M." or "?").
+                    # parts[0] = status chars, parts[-1] = path, remaining are path-info.
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    status_str = parts[0]
+                    # Stage digit is always at the start of parts[0] as a separate token.
+                    # If parts[0] is a single digit, the real status is in parts[1].
+                    if len(parts) >= 3 and parts[0].isdigit() and len(parts[1]) >= 2:
+                        status_str = parts[1]
+                    # Now parse <index><worktree> from status_str.
+                    index = status_str[0] if len(status_str) >= 1 else " "
+                    worktree = status_str[1] if len(status_str) >= 2 else " "
+                    path_val = parts[-1] if parts else ""
+                    state = "modified" if index == "M" or worktree == "M" else (
+                        "added" if index == "A" or worktree == "A" else (
+                        "deleted" if index == "D" or worktree == "D" else (
+                        "untracked" if index == "?" else "untracked")))
+                    if state not in change_paths:
+                        change_states[state] = 0
+                        change_paths[state] = []
+                    change_states[state] = change_states.get(state, 0) + 1
+                    if len(change_paths[state]) < 20:
+                        change_paths[state].append(path_val)
+            out["branch"] = branch
+            out["ahead"] = ahead
+            out["behind"] = behind
+            out["changes"] = {k: change_paths.get(k, []) for k, v in change_states.items()}
+            out["change_count"] = sum(change_states.values())
+    except (subprocess.TimeoutExpired, Exception):
+        pass  # branch info is best-effort
+
+    # --- last commit ---
+    try:
+        result = subprocess.run(
+            ["git", "-C", _WORKDIR, "log", "-1", "--format=%h%x09%ar%x09%s"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split("\t", 2)
+            if len(parts) >= 3:
+                out["last_commit"] = {
+                    "hash": parts[0].strip(),
+                    "when": parts[1].strip(),
+                    "subject": parts[2].strip(),
+                }
+    except (subprocess.TimeoutExpired, Exception):
+        pass  # last commit is best-effort
+
+    return out
+
+
 # --------------------------------------------------------------------------
 # Tool registry
 #
@@ -122,6 +285,8 @@ def tool_read_file(path, **_):
 # periodic commentary, so screenshots are allowed to create memories.
 SIDE_EFFECTING_TOOLS = frozenset({
     "write_file", "read_file", "forget", "adjust_gold",
+    "buy_treasure",
+    "clipboard_read", "list_files", "set_reminder", "cancel_reminder",
 })
 
 
@@ -362,6 +527,145 @@ def build_tools(platform):
                                "the operator asks how much gold you have, or to check "
                                "your hoard.",
                 "parameters": {"type": "object", "properties": {}},
+            }}),
+        "buy_treasure": (tool_buy_treasure, {
+            "type": "function",
+            "function": {
+                "name": "buy_treasure",
+                "description": "Purchase a treasure from your hoard. You invent the item — "
+                               "a vivid name and short description. Code sets the price by tier. "
+                               "You can spend only when the operator invites you or agrees "
+                               "after you ask. Never buy unprompted mid-commentary.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Your name for the treasure (≤ 60 chars). Invent it vividly.",
+                        },
+                        "tier": {
+                            "type": "string",
+                            "enum": ["trinket", "gem", "relic", "wonder"],
+                            "description": "The tier: trinket (50), gem (250), relic (1000), wonder (5000).",
+                        },
+                        "desc": {
+                            "type": "string",
+                            "description": "A short description of the treasure in your voice (≤ 200 chars).",
+                        },
+                    },
+                    "required": ["name", "tier"],
+                },
+            }}),
+        "list_treasures": (tool_list_treasures, {
+            "type": "function",
+            "function": {
+                "name": "list_treasures",
+                "description": "List all treasures you own, newest first, with their tier, cost, "
+                               "and the collection's total value. Call this before boasting "
+                               "about your hoard so you name real ones.",
+                "parameters": {"type": "object", "properties": {}},
+            }}),
+        "gold_history": (tool_gold_history, {
+            "type": "function",
+            "function": {
+                "name": "gold_history",
+                "description": "Browse the history of how your hoard changed. Shows adjustments "
+                               "and purchases with humanized timestamps. Call this when asked why "
+                               "the hoard changed — it's the ground truth, not your guesswork.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max events to return (1–25, default 10).",
+                        },
+                    },
+                },
+            }}),
+        "list_files": (tool_list_files, {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List entries in a directory under the current working directory. "
+                               "Non-recursive, one level per call — the model walks by passing "
+                               "each path. Returns dirs-first sorted basenames with types and "
+                               "file sizes. Use forward slashes for relative paths.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path (from the script's directory) "
+                                           "of the directory to list. Use forward slashes. "
+                                           "Defaults to the working directory root.",
+                        },
+                    },
+                },
+            }}),
+        "git_status": (tool_git_status, {
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Get a read-only snapshot of the git repo at the working "
+                               "directory — branch, ahead/behind, changed files, last commit. "
+                               "Does not touch the network or mutate state.",
+                "parameters": {"type": "object", "properties": {}},
+            }}),
+        "clipboard_read": (lambda **_: platform.read_clipboard() if hasattr(platform, "read_clipboard") else {"error": "clipboard not available on this platform"}, {
+            "type": "function",
+            "function": {
+                "name": "clipboard_read",
+                "description": "Return the current text clipboard content (up to 8 KB). "
+                               "Use when the request refers to 'what I copied' or 'the clipboard'. "
+                               "The clipboard may hold passwords/tokens — do NOT save clipboard "
+                               "contents via remember; quote it in your answer instead.",
+                "parameters": {"type": "object", "properties": {}},
+            }}),
+        "set_reminder": (tool_set_reminder, {
+            "type": "function",
+            "function": {
+                "name": "set_reminder",
+                "description": "Schedule a reminder for a future time. Call `now` first "
+                               "to get the current time, then compute the absolute due time. "
+                               "Use when the operator says 'remind me to X at/in Y'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "What to remind about, e.g. 'stretch'.",
+                        },
+                        "due_iso": {
+                            "type": "string",
+                            "description": "Absolute ISO 8601 time string (e.g. '2026-07-01T15:40:00-07:00').",
+                        },
+                    },
+                    "required": ["text", "due_iso"],
+                },
+            }}),
+        "list_reminders": (tool_list_reminders, {
+            "type": "function",
+            "function": {
+                "name": "list_reminders",
+                "description": "List all pending scheduled reminders with ids, due times, "
+                               "and origin host.",
+                "parameters": {"type": "object", "properties": {}},
+            }}),
+        "cancel_reminder": (tool_cancel_reminder, {
+            "type": "function",
+            "function": {
+                "name": "cancel_reminder",
+                "description": "Cancel a pending scheduled reminder by id (from list_reminders).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The id of the reminder to cancel.",
+                        },
+                    },
+                    "required": ["id"],
+                },
             }}),
     }
 

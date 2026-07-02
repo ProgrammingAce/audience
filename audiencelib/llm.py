@@ -3,9 +3,77 @@ OpenAI-compatible chat endpoint."""
 
 import base64
 import json
+import urllib.error
 import urllib.request
 
 from .tools import run_tool, SIDE_EFFECTING_TOOLS
+
+
+# --------------------------------------------------------------------------
+# JSON-schema response formats for dream / reflect (strict, no prose).
+# --------------------------------------------------------------------------
+
+DREAM_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "dream",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string"},
+                            "subject": {"type": "string", "enum": ["operator", "self"]},
+                            "text": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["category", "subject", "text", "confidence"],
+                        "additionalProperties": False,
+                    },
+                },
+                "episode": {
+                    "type": ["string", "null"],
+                    "description": "One-line summary ≤25 words of what the operator "
+                    "was doing/struggling with this session, or null if nothing "
+                    "notable."
+                },
+            },
+            "required": ["memories"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+REFLECT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "reflect",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["text", "confidence"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["memories"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 # --------------------------------------------------------------------------
@@ -77,7 +145,8 @@ def _read_stream(resp, on_delta):
 
 
 def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
-              source=None, on_delta=None):
+              source=None, on_delta=None, temperature=0.7,
+              response_format=None):
     # image_bytes is optional: typed questions are sent as plain text, while
     # the periodic commentary attaches a fresh screenshot. `source` is the call
     # provenance, threaded to run_tool so the remember tool clamps confidence.
@@ -122,16 +191,12 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
     for _ in range(4):
         payload = {
             "messages": messages,
-            "temperature": 0.7,
+            "temperature": temperature,
             "max_tokens": max_tokens,
-            # Stream tokens so callers can paint the reply as it's produced; the
-            # total generation time is unchanged, only when text appears.
             "stream": True,
-            # Skip the reasoning phase: ~10x faster and content lands directly
-            # in the message instead of reasoning_content. Honored by the
-            # server's jinja chat template.
-            "chat_template_kwargs": {"enable_thinking": False},
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         # Only advertise tools when there are some — a dream call passes none, and
         # some servers reject an empty tools array paired with tool_choice.
         if schemas:
@@ -140,8 +205,24 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
         req = urllib.request.Request(
             url, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            msg, finish_reason = _read_stream(resp, on_delta)
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                msg, finish_reason = _read_stream(resp, on_delta)
+        except urllib.error.HTTPError as e:
+            # Some servers don't support response_format — fall back once.
+            if (response_format is not None
+                    and e.code is not None
+                    and "response_format" in (e.read().decode("utf-8", "replace")
+                                              + e.reason)):
+                response_format = None
+                payload.pop("response_format", None)
+                req = urllib.request.Request(
+                    url, data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    msg, finish_reason = _read_stream(resp, on_delta)
+            else:
+                raise
 
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:

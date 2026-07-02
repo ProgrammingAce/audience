@@ -30,10 +30,38 @@ Everything uses the standard library only, matching the rest of the app.
 """
 
 import json
+import os
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Module-level mutable state for token auth (set by start_server).
+_serve_token = None
+_warned_unauthenticated = False
+
+
+def set_serve_token(token):
+    """Configure the auth token; log a one-time warning if token is None (unauthenticated)."""
+    global _serve_token, _warned_unauthenticated
+    _serve_token = token
+    if token is None and not _warned_unauthenticated:
+        print(
+            "[warning] state server is running without authentication; "
+            "set AUDIENCE_TOKEN or --serve-token to enable auth",
+            flush=True,
+        )
+        _warned_unauthenticated = True
+
+
+def _check_auth(handler):
+    """Return True if the request is authenticated (token configured and header present)."""
+    if _serve_token is None:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:] == _serve_token
+    return auth == _serve_token
 
 
 def _snapshot_log(app):
@@ -65,7 +93,17 @@ def make_handler(app):
             self.end_headers()
             self.wfile.write(body)
 
+
+        def _require_auth(self):
+            """Return False and send 401 if auth is required and missing."""
+            if not _check_auth(self):
+                self._send_json({"error": "unauthorized"}, status=401)
+                return False
+            return True
+
         def do_GET(self):
+            if not self._require_auth():
+                return
             if self.path == "/health":
                 self._send_json({"ok": True})
             elif self.path == "/state":
@@ -82,6 +120,8 @@ def make_handler(app):
                 self._send_json({"error": "not found"}, status=404)
 
         def do_POST(self):
+            if not self._require_auth():
+                return
             if self.path != "/command":
                 self._send_json({"error": "not found"}, status=404)
                 return
@@ -108,13 +148,25 @@ def make_handler(app):
     return StateHandler
 
 
-def start_server(app, host="0.0.0.0", port=8770):
+def start_server(app, host="0.0.0.0", port=8770, token=None):
     """Start the state server on a daemon thread and return the server.
+
+    Parameters
+    ----------
+    app : Audience
+        The running audience application instance.
+    host, port : str, int
+        Bind address and port (default 0.0.0.0:8770).
+    token : str | None
+        Optional bearer token for authentication. When set, all requests must
+        include ``Authorization: Bearer <token>``; when unset the server works
+        without auth but logs a one-time warning.
 
     Returns the ``ThreadingHTTPServer`` so the caller can ``shutdown()`` it,
     or ``None`` if the socket could not be bound (e.g. port in use) — a remote
     mirror is a convenience, so a bind failure should never take down the app.
     """
+    set_serve_token(token)
     try:
         httpd = ThreadingHTTPServer((host, port), make_handler(app))
     except OSError as e:

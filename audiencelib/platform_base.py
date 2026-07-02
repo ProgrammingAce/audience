@@ -100,6 +100,10 @@ class Platform:
         """Currently playing track/app as a string (may be empty)."""
         raise NotImplementedError
 
+    def read_clipboard(self):
+        """Current clipboard text, or None if empty/non-text/unavailable."""
+        return None
+
     # --- session / UI lifecycle -------------------------------------------
     def begin_session(self):
         """Called once before curses starts (e.g. capture the launch window)."""
