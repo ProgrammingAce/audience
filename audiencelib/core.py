@@ -826,7 +826,6 @@ class Audience:
         return " ".join(cleaned).lower()
 
     @staticmethod
-    @staticmethod
     def _fact_line(m, now):
         """One long-term fact rendered for the dream, with its age, subject, pin."""
         conf = _clamp_confidence(m.get("confidence"), _DEFAULT_CONFIDENCE)
