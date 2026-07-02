@@ -194,6 +194,11 @@ def ask_model(url, image_bytes, question, system, tools, max_tokens=450,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
+            # The custom chat template (gemma_fixed.jinja) supports thinking,
+            # and llama-server defaults enable_thinking to ON for such
+            # templates. Left unset, every reply burns its token budget on
+            # reasoning; this must stay explicitly off.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if response_format is not None:
             payload["response_format"] = response_format
